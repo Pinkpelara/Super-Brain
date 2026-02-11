@@ -8,7 +8,7 @@
  * - full-corpus activation on each query,
  * - semantic/concept bridge retrieval,
  * - explicit mental-model construction before answer generation,
- * - strict source grounding with continuity-safe session handling,
+ * - strict source grounding with continuity-safe context handling,
  * - stronger claim-level citation and uncertainty repair.
  *
  * Nature inspiration reference:
@@ -27,12 +27,12 @@
     const MAX_MENTAL_MODEL_SOURCES = 36;
     const MAX_EVIDENCE_DIGEST_CHARS = 14000;
     const MIN_CITATIONS_FOR_RICH_CORPUS = 4;
-    const MAX_ITERATIVE_RETRIEVAL_PASSES = 4;
-    const RETRIEVAL_STABILIZATION_REQUIRED = 2;
-    const MIN_BROAD_SCOPE_DOCS = 2;
-    const MAX_MODEL_STABILIZATION_CYCLES = 3;
-    const MODEL_STABILIZATION_REQUIRED = 1;
-    const MAX_CITATION_GATE_REPAIRS = 2;
+    const MAX_RETRIEVAL_REFINEMENT_PASSES = 4;
+    const RETRIEVAL_STABLE_CHUNK_DELTA = 3;
+    const MAX_MODEL_REFINEMENT_PASSES = 3;
+    const MODEL_GAP_THRESHOLD = 6;
+    const MAX_GAP_REFINEMENT_QUERIES = 4;
+    const MIN_CROSS_SOURCE_DOCS = 2;
 
     const COGNITION_PRIOR = [
         'Abstract latent task structure from surface wording.',
@@ -81,7 +81,7 @@
             `- Activated documents in retrieval: ${report.activatedDocuments}/${report.totalDocuments}`,
             `- Activated chunk count: ${report.activatedChunks}/${report.totalChunks}`,
             `- Activation coverage: ${report.activationCoveragePct}%`,
-            `- Retrieval passes: ${report.retrievalPasses || 1} (stabilized: ${report.stabilized ? 'yes' : 'no'})`,
+            `- Retrieval passes: ${report.retrievalPasses || 1} (stabilized: ${report.retrievalStabilized ? 'yes' : 'no'})`,
             `- Cross-document bridge concepts: ${concepts || 'N/A'}`
         ].join('\n');
     }
@@ -360,116 +360,153 @@
 
         if (typeof CognitiveRetriever.prototype.superBrainResolveQueryFromSession !== 'function') {
             CognitiveRetriever.prototype.superBrainResolveQueryFromSession = function superBrainResolveQueryFromSession(query) {
-                const rawQuery = String(query || '').trim();
-                if (!rawQuery) return rawQuery;
-                const needsResolution = /\b(it|this|that|those|these|they|them|the previous|previous one|same one|compare it|what about)\b/i.test(rawQuery);
-                if (!needsResolution) return rawQuery;
+                const raw = String(query || '').trim();
+                if (!raw) return raw;
+                const hasReference = /\b(it|this|that|those|these|they|them|previous|same one|compare it|what about)\b/i.test(raw);
+                if (!hasReference) return raw;
                 const history = (typeof window !== 'undefined' && window.app?.synthesizer?.conversationHistory)
                     ? window.app.synthesizer.conversationHistory
                     : [];
-                if (!Array.isArray(history) || !history.length) return rawQuery;
-                const recentUser = history.slice().reverse().find(item => item?.role === 'user' && String(item?.content || '').trim().length > 0);
-                if (!recentUser) return rawQuery;
-                const contextHint = String(recentUser.content || '').replace(/\s+/g, ' ').trim().slice(0, 260);
-                if (!contextHint) return rawQuery;
-                return `${rawQuery}\n\n[Session reference hint: prior user context = ${contextHint}]`;
+                if (!Array.isArray(history) || !history.length) return raw;
+                const recentUser = history.slice().reverse().find(item => item?.role === 'user' && String(item?.content || '').trim());
+                if (!recentUser) return raw;
+                const hint = String(recentUser.content || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+                if (!hint) return raw;
+                return `${raw}\n\n[Continuity hint from prior user turn: ${hint}]`;
             };
         }
 
-        if (typeof CognitiveRetriever.prototype.buildIterativeQueries !== 'function') {
-            CognitiveRetriever.prototype.buildIterativeQueries = function buildIterativeQueries(query, intent = {}) {
-                const baseVariants = typeof this.generateQueryVariants === 'function'
-                    ? this.generateQueryVariants(query, intent)
-                    : [String(query || '').trim()];
-                const expansion = [
-                    `${query} entities relationships constraints exceptions`,
-                    `${query} conflicts dependencies tradeoffs missing information`,
-                    `${query} cross-document evidence and coverage check`
-                ];
-                if (intent.comparative) expansion.push(`${query} compare alternatives pros cons evidence`);
-                if (intent.timeline) expansion.push(`${query} chronology sequence milestone dependencies`);
-                const normalizedOriginal = normalizeConcept(query);
-                return uniqBy(
-                    [...baseVariants, ...expansion]
-                        .map(item => String(item || '').replace(/\s+/g, ' ').trim())
+        if (typeof CognitiveRetriever.prototype.superBrainBuildIntentGraph !== 'function') {
+            CognitiveRetriever.prototype.superBrainBuildIntentGraph = function superBrainBuildIntentGraph(query) {
+                const normalized = String(query || '').replace(/\s+/g, ' ').trim();
+                const entities = typeof this.extractEntities === 'function' ? this.extractEntities(normalized).slice(0, 20) : [];
+                const concepts = typeof this.extractConcepts === 'function' ? this.extractConcepts(normalized).slice(0, 24) : [];
+                const constraints = (normalized.match(/\b(must|cannot|only|required|unless|except|without|at least|at most)\b[^.?!;]{0,80}/gi) || []).slice(0, 10);
+                const relations = (normalized.match(/\b(cause|impact|depends on|related to|trade[- ]?off|compare|versus|vs)\b[^.?!;]{0,80}/gi) || []).slice(0, 10);
+                const unknowns = (normalized.match(/\b(uncertain|unknown|missing|need|evidence|prove|validate)\b[^.?!;]{0,80}/gi) || []).slice(0, 10);
+                return { raw: normalized, entities, concepts, constraints, relations, unknowns };
+            };
+        }
+
+        if (typeof CognitiveRetriever.prototype.superBrainBuildProbeQueries !== 'function') {
+            CognitiveRetriever.prototype.superBrainBuildProbeQueries = function superBrainBuildProbeQueries(query, intentGraph = null, intent = {}) {
+                const graph = intentGraph || this.superBrainBuildIntentGraph(query);
+                const probes = [];
+                const push = (value) => {
+                    const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
+                    if (cleaned) probes.push(cleaned);
+                };
+                push(`${query} semantic evidence relationships constraints`);
+                if (graph.entities.length) push(`${query} ${graph.entities.slice(0, 4).join(' ')} evidence across documents`);
+                if (graph.concepts.length) push(`${query} ${graph.concepts.slice(0, 5).join(' ')} implicit links`);
+                if (graph.constraints.length) push(`${query} constraints exceptions conflicts`);
+                if (graph.relations.length || intent.comparative) push(`${query} compare trade-offs and dependencies`);
+                if (intent.timeline) push(`${query} chronology sequence and milestones`);
+                if (graph.unknowns.length) push(`${query} missing evidence validation`);
+                return uniqBy(probes, item => normalizeConcept(item)).slice(0, MAX_RETRIEVAL_REFINEMENT_PASSES * 2);
+            };
+        }
+
+        if (typeof CognitiveRetriever.prototype.superBrainDeepScanAugment !== 'function') {
+            CognitiveRetriever.prototype.superBrainDeepScanAugment = function superBrainDeepScanAugment(query, selectedChunks = [], targetTopK = DEFAULT_TARGET_K_SMALL) {
+                const out = Array.isArray(selectedChunks) ? selectedChunks.slice() : [];
+                const seen = new Set(out.map(item => item.id));
+                const docNames = uniqBy(out.map(item => item.filename).filter(Boolean), item => item);
+                if (!docNames.length) return out;
+                const qTokens = typeof this.tokenize === 'function' ? this.tokenize(query) : normalizeConcept(query).split(/\s+/).filter(Boolean);
+                const qEntities = typeof this.extractEntities === 'function' ? this.extractEntities(query) : [];
+                const qConcepts = typeof this.extractConcepts === 'function' ? this.extractConcepts(query) : [];
+
+                for (const filename of docNames) {
+                    const docChunks = (this.allChunks || [])
+                        .filter(item => item.filename === filename)
+                        .sort((a, b) => (a.index || 0) - (b.index || 0));
+                    if (docChunks.length < 4) continue;
+
+                    const midIdx = Math.floor(docChunks.length / 2);
+                    const lateIdx = Math.floor(docChunks.length * 0.8);
+                    const candidates = [docChunks[midIdx], docChunks[lateIdx], docChunks[docChunks.length - 1]]
                         .filter(Boolean)
-                        .filter(item => normalizeConcept(item) !== normalizedOriginal),
-                    item => normalizeConcept(item)
-                ).slice(0, MAX_ITERATIVE_RETRIEVAL_PASSES * 2);
+                        .map(chunk => ({
+                            ...chunk,
+                            score: typeof this.calculateRelevanceScore === 'function'
+                                ? this.calculateRelevanceScore(chunk, query, qTokens, qEntities, qConcepts)
+                                : 0
+                        }))
+                        .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+                    for (const candidate of candidates) {
+                        if (out.length >= targetTopK) break;
+                        if (!candidate?.id || seen.has(candidate.id)) continue;
+                        out.push(candidate);
+                        seen.add(candidate.id);
+                    }
+                    if (out.length >= targetTopK) break;
+                }
+
+                return out.slice(0, targetTopK);
             };
         }
 
-        if (typeof CognitiveRetriever.prototype.applyIterativeRetrievalPasses !== 'function') {
-            CognitiveRetriever.prototype.applyIterativeRetrievalPasses = async function applyIterativeRetrievalPasses(
-                query,
-                mergedSeed,
-                targetTopK,
-                options = {},
-                intent = {},
-                originalRetrieve = null
-            ) {
+        if (typeof CognitiveRetriever.prototype.superBrainRunRetrievalRefinement !== 'function') {
+            CognitiveRetriever.prototype.superBrainRunRetrievalRefinement = async function superBrainRunRetrievalRefinement(query, seedChunks = [], topK = DEFAULT_TARGET_K_SMALL, options = {}, intent = {}, originalRetrieve = null) {
                 if (typeof originalRetrieve !== 'function') {
-                    return { merged: mergedSeed || [], passCount: 1, stabilized: false };
+                    return { chunks: seedChunks || [], passes: 1, stabilized: true, intentGraph: this.superBrainBuildIntentGraph(query) };
                 }
 
-                let merged = Array.isArray(mergedSeed) ? mergedSeed.slice() : [];
-                const iterationQueries = this.buildIterativeQueries(query, intent);
-                if (!iterationQueries.length) {
-                    return { merged, passCount: 1, stabilized: false };
-                }
-
-                let passCount = 1;
-                let stablePasses = 0;
-                let prevDocCount = new Set(merged.map(chunk => chunk.filename)).size;
+                const intentGraph = this.superBrainBuildIntentGraph(query);
+                const probes = this.superBrainBuildProbeQueries(query, intentGraph, intent);
+                let merged = Array.isArray(seedChunks) ? seedChunks.slice() : [];
+                let passes = 1;
+                let stableHits = 0;
                 let prevChunkCount = merged.length;
+                let prevDocCount = new Set(merged.map(item => item.filename)).size;
 
-                for (const iterQuery of iterationQueries) {
-                    if (passCount >= MAX_ITERATIVE_RETRIEVAL_PASSES) break;
+                for (const probe of probes) {
+                    if (passes >= MAX_RETRIEVAL_REFINEMENT_PASSES) break;
+                    let passBase = [];
                     try {
-                        const passBase = await originalRetrieve.call(
+                        passBase = await originalRetrieve.call(
                             this,
-                            iterQuery,
-                            Math.max(18, Math.ceil(targetTopK * 0.78)),
-                            { ...options, intent }
+                            probe,
+                            Math.max(18, Math.ceil(topK * 0.8)),
+                            { ...options, intent: { ...intent, broadCoverage: true } }
                         );
-                        const passAnchors = typeof this.getDocumentAnchors === 'function'
-                            ? this.getDocumentAnchors(iterQuery, intent)
-                            : [];
-                        let passMerged = typeof this.mergeUniqueChunks === 'function'
-                            ? this.mergeUniqueChunks(passBase, passAnchors, Math.max(targetTopK * 2, 70))
-                            : uniqBy([...passBase, ...passAnchors], item => item.id);
-                        const passLinks = typeof this.expandImplicitConceptLinks === 'function'
-                            ? this.expandImplicitConceptLinks(passMerged, iterQuery, Math.max(8, Math.floor(MAX_LINK_EXPANSION * 0.75)))
-                            : [];
-                        passMerged = typeof this.mergeUniqueChunks === 'function'
-                            ? this.mergeUniqueChunks(passMerged, passLinks, Math.max(targetTopK * 2, 110))
-                            : uniqBy([...passMerged, ...passLinks], item => item.id);
-                        merged = typeof this.mergeUniqueChunks === 'function'
-                            ? this.mergeUniqueChunks(merged, passMerged, Math.max(targetTopK * 4, 170))
-                            : uniqBy([...merged, ...passMerged], item => item.id);
                     } catch {
-                        // Keep current evidence if an iterative pass fails.
+                        passBase = [];
                     }
+                    const anchors = typeof this.getDocumentAnchors === 'function' ? this.getDocumentAnchors(probe, { ...intent, broadCoverage: true }) : [];
+                    const links = typeof this.expandImplicitConceptLinks === 'function'
+                        ? this.expandImplicitConceptLinks(passBase || [], probe, Math.max(8, Math.floor(MAX_LINK_EXPANSION * 0.8)))
+                        : [];
+                    const mergedProbe = typeof this.mergeUniqueChunks === 'function'
+                        ? this.mergeUniqueChunks(
+                            this.mergeUniqueChunks(passBase || [], anchors || [], Math.max(topK * 2, 90)),
+                            links || [],
+                            Math.max(topK * 3, 120)
+                        )
+                        : uniqBy([...(passBase || []), ...(anchors || []), ...(links || [])], item => item.id);
+                    merged = typeof this.mergeUniqueChunks === 'function'
+                        ? this.mergeUniqueChunks(merged, mergedProbe, Math.max(topK * 4, 170))
+                        : uniqBy([...merged, ...mergedProbe], item => item.id);
 
-                    const docCount = new Set(merged.map(chunk => chunk.filename)).size;
                     const chunkCount = merged.length;
-                    const docDelta = docCount - prevDocCount;
+                    const docCount = new Set(merged.map(item => item.filename)).size;
                     const chunkDelta = chunkCount - prevChunkCount;
-                    if (docDelta <= 0 && chunkDelta <= Math.max(2, Math.ceil(targetTopK * 0.08))) {
-                        stablePasses += 1;
-                    } else {
-                        stablePasses = 0;
-                    }
-                    prevDocCount = docCount;
+                    const docDelta = docCount - prevDocCount;
+                    if (docDelta <= 0 && chunkDelta <= RETRIEVAL_STABLE_CHUNK_DELTA) stableHits += 1;
+                    else stableHits = 0;
                     prevChunkCount = chunkCount;
-                    passCount += 1;
-                    if (stablePasses >= RETRIEVAL_STABILIZATION_REQUIRED) break;
+                    prevDocCount = docCount;
+                    passes += 1;
+                    if (stableHits >= 1) break;
                 }
 
                 return {
-                    merged,
-                    passCount,
-                    stabilized: stablePasses >= RETRIEVAL_STABILIZATION_REQUIRED
+                    chunks: merged,
+                    passes,
+                    stabilized: stableHits >= 1,
+                    intentGraph
                 };
             };
         }
@@ -683,268 +720,25 @@ ${evidenceDigest}`
             };
         }
 
-        if (typeof CognitiveSynthesizer.prototype.superBrainIsBroadScopeQuestion !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainIsBroadScopeQuestion = function superBrainIsBroadScopeQuestion(query) {
-                const q = safeLower(query);
-                return /\b(overall|across|entire|comprehensive|cross[- ]source|cross[- ]document|compare|contrast|trade-?off|decision|recommend|strategy|policy|roadmap|portfolio|program-level)\b/.test(q);
-            };
-        }
-
-        if (typeof CognitiveSynthesizer.prototype.superBrainBuildCitationLine !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainBuildCitationLine = function superBrainBuildCitationLine(source, queryTokens = []) {
-                if (!source) return '';
-                const filename = source.filename || 'Unknown source';
-                const page = source.page || 'N/A';
-                const sentences = String(source.text || '').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
-                let sentence = sentences[0] || String(source.text || '').slice(0, 220);
-                if (queryTokens.length && sentences.length) {
-                    let best = sentence;
-                    let bestScore = -1;
-                    for (const s of sentences) {
-                        const lower = safeLower(s);
-                        const score = queryTokens.reduce((acc, token) => acc + (lower.includes(token) ? 1 : 0), 0);
-                        if (score > bestScore) {
-                            best = s;
-                            bestScore = score;
-                        }
-                    }
-                    sentence = best;
-                }
-                sentence = sentence.replace(/\s+/g, ' ').trim().slice(0, 210);
-                if (!sentence) return '';
-                const quote = sentence.slice(0, 110).replace(/"/g, '\'');
-                return `- ${sentence} [Source: ${filename}, page ${page}, "${quote || 'relevant quote'}"]`;
-            };
-        }
-
-        if (typeof CognitiveSynthesizer.prototype.superBrainRequiredCrossSourceDocs !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainRequiredCrossSourceDocs = function superBrainRequiredCrossSourceDocs(query, totalDocs = 0, instructionProfile = {}) {
-                const broadScope = this.superBrainIsBroadScopeQuestion(query);
-                const decisionLike = !!instructionProfile?.decisionMode;
-                if (!broadScope && !decisionLike) return 1;
-                if (totalDocs >= 12) return 3;
-                if (totalDocs >= 7) return 3;
-                if (totalDocs >= MIN_BROAD_SCOPE_DOCS) return 2;
-                return 1;
-            };
-        }
-
         if (typeof CognitiveSynthesizer.prototype.superBrainBuildGapDrivenQueries !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainBuildGapDrivenQueries = function superBrainBuildGapDrivenQueries(query, model = null, completeness = null) {
+            CognitiveSynthesizer.prototype.superBrainBuildGapDrivenQueries = function superBrainBuildGapDrivenQueries(query, model = null) {
                 const out = [];
-                const add = (item) => {
-                    const normalized = String(item || '').replace(/\s+/g, ' ').trim();
-                    if (!normalized) return;
-                    out.push(normalized);
+                const push = (value) => {
+                    const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
+                    if (cleaned) out.push(cleaned);
                 };
-                add(`${query} cross-document evidence and conflicts`);
-                add(`${query} constraints exceptions dependencies`);
-                if (Array.isArray(model?.gaps)) {
-                    for (const gapRaw of model.gaps.slice(0, 4)) {
-                        const gap = String(gapRaw || '')
-                            .replace(/^Insufficient direct evidence for concept:\s*/i, '')
-                            .replace(/"/g, '')
-                            .trim();
-                        if (!gap) continue;
-                        add(`${query} ${gap} supporting evidence`);
-                    }
+                push(`${query} cross-source supporting evidence`);
+                push(`${query} constraints exceptions conflicts`);
+                const gaps = Array.isArray(model?.gaps) ? model.gaps : [];
+                for (const gapRaw of gaps.slice(0, MAX_GAP_REFINEMENT_QUERIES)) {
+                    const gap = String(gapRaw || '')
+                        .replace(/^Insufficient direct evidence for concept:\s*/i, '')
+                        .replace(/"/g, '')
+                        .trim();
+                    if (!gap) continue;
+                    push(`${query} ${gap} validating evidence`);
                 }
-                if ((completeness?.docCount || 0) < (completeness?.requiredDocs || 2)) {
-                    add(`${query} independent sources corroboration`);
-                }
-                return uniqBy(out, item => normalizeConcept(item)).slice(0, 6);
-            };
-        }
-
-        if (typeof CognitiveSynthesizer.prototype.superBrainHasRequiredSections !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainHasRequiredSections = function superBrainHasRequiredSections(text, instructionProfile = {}, query = '') {
-                const value = String(text || '');
-                const lower = safeLower(value);
-                const hasMental = /mental model/i.test(value);
-                const hasEvidenceSection = /evidence[- ]based|evidence synthesis|evidence-based expert answer/i.test(value);
-                const hasUncertainty = /uncertaint|missing information|evidence gap|cannot fully confirm/i.test(value);
-                if (!(hasMental && hasUncertainty)) return false;
-
-                const needsDecisionShape = !!instructionProfile?.decisionMode || this.superBrainIsBroadScopeQuestion(query);
-                if (!needsDecisionShape) return hasEvidenceSection || /\bevidence\b/i.test(value);
-
-                const hasRecommendation = /recommendation|recommended action|i recommend|recommended option/i.test(lower);
-                const hasTradeoffs = /trade-?off|options|pros|cons|risk analysis|risk/i.test(lower);
-                return hasEvidenceSection && hasRecommendation && hasTradeoffs;
-            };
-        }
-
-        if (typeof CognitiveSynthesizer.prototype.superBrainEvaluateCitationGate !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainEvaluateCitationGate = function superBrainEvaluateCitationGate(query, responseText, diagnostics = null, instructionProfile = {}) {
-                const safeDiagnostics = diagnostics || {};
-                const citationCoverage = Number.isFinite(safeDiagnostics.claimCitationCoverage) ? safeDiagnostics.claimCitationCoverage : 0;
-                const supportRatio = Number.isFinite(safeDiagnostics.claimSupportRatio) ? safeDiagnostics.claimSupportRatio : 0;
-                const citationPrecision = Number.isFinite(safeDiagnostics.citationPrecision) ? safeDiagnostics.citationPrecision : 0;
-                const totalClaims = Number.isFinite(safeDiagnostics.totalClaims) ? safeDiagnostics.totalClaims : 0;
-                const citationCount = Number.isFinite(safeDiagnostics.citationCount) ? safeDiagnostics.citationCount : 0;
-                const broadOrDecision = !!instructionProfile?.decisionMode || this.superBrainIsBroadScopeQuestion(query);
-                const minCoverage = broadOrDecision ? 0.66 : 0.58;
-                const minSupport = broadOrDecision ? 0.40 : 0.32;
-                const minPrecision = broadOrDecision ? 0.48 : 0.40;
-                const hasSections = this.superBrainHasRequiredSections(responseText, instructionProfile, query);
-
-                const failCoverage = totalClaims >= 3 && citationCoverage < minCoverage;
-                const failSupport = totalClaims >= 3 && supportRatio < minSupport;
-                const failPrecision = citationCount > 0 && citationPrecision < minPrecision;
-                const failSections = !hasSections;
-                const reasons = [];
-                if (failCoverage) reasons.push(`Claim citation coverage too low (${(citationCoverage * 100).toFixed(1)}%).`);
-                if (failSupport) reasons.push(`Claim support ratio too low (${(supportRatio * 100).toFixed(1)}%).`);
-                if (failPrecision) reasons.push(`Citation precision too low (${(citationPrecision * 100).toFixed(1)}%).`);
-                if (failSections) reasons.push('Required expert-structure sections are missing.');
-
-                return {
-                    passed: reasons.length === 0,
-                    reasons,
-                    failCoverage,
-                    failSupport,
-                    failPrecision,
-                    failSections,
-                    evidenceFailure: failCoverage || failSupport || failPrecision,
-                    minCoverage,
-                    minSupport,
-                    minPrecision,
-                    hasSections
-                };
-            };
-        }
-
-        if (typeof CognitiveSynthesizer.prototype.superBrainRunMentalModelStabilization !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainRunMentalModelStabilization = async function superBrainRunMentalModelStabilization(
-                query,
-                relevantChunks = [],
-                attachmentContext = null,
-                localStats = {},
-                appRetriever = null,
-                instructionProfile = {}
-            ) {
-                let workingChunks = Array.isArray(relevantChunks) ? relevantChunks.slice() : [];
-                const shouldIterate = (
-                    this.superBrainIsBroadScopeQuestion(query) ||
-                    !!instructionProfile?.decisionMode ||
-                    (localStats.numDocs || 0) >= 8 ||
-                    workingChunks.length >= 16
-                );
-                let stableCycles = 0;
-                let prevGapCount = null;
-                let prevDocCount = new Set(workingChunks.map(item => item.filename)).size;
-                let prevChunkCount = workingChunks.length;
-                let latestModel = null;
-                let latestCompleteness = null;
-                let passes = 1;
-
-                if (!shouldIterate) {
-                    const quickSources = uniqBy(
-                        [
-                            ...(attachmentContext?.chunks || []).map(item => ({ ...item, filename: attachmentContext?.name || item.filename || 'attachment' })),
-                            ...workingChunks
-                        ],
-                        item => item.id || `${item.filename}:${item.index || 0}:${item.page || 'na'}`
-                    ).slice(0, MAX_MENTAL_MODEL_SOURCES * 2);
-                    latestModel = await this.superBrainBuildModel(query, workingChunks, attachmentContext, localStats);
-                    latestCompleteness = this.superBrainAssessEvidenceCompleteness(
-                        query,
-                        quickSources,
-                        localStats.activationReport || {},
-                        latestModel,
-                        null,
-                        localStats,
-                        instructionProfile
-                    );
-                    return {
-                        stabilizedChunks: workingChunks,
-                        mentalModel: latestModel,
-                        completeness: latestCompleteness,
-                        passes,
-                        stabilized: true
-                    };
-                }
-
-                for (let cycle = 0; cycle < MAX_MODEL_STABILIZATION_CYCLES; cycle++) {
-                    passes = cycle + 1;
-                    const candidateSources = uniqBy(
-                        [
-                            ...(attachmentContext?.chunks || []).map(item => ({ ...item, filename: attachmentContext?.name || item.filename || 'attachment' })),
-                            ...workingChunks
-                        ],
-                        item => item.id || `${item.filename}:${item.index || 0}:${item.page || 'na'}`
-                    ).slice(0, MAX_MENTAL_MODEL_SOURCES * 3);
-
-                    latestModel = await this.superBrainBuildModel(query, workingChunks, attachmentContext, localStats);
-                    latestCompleteness = this.superBrainAssessEvidenceCompleteness(
-                        query,
-                        candidateSources,
-                        localStats.activationReport || {},
-                        latestModel,
-                        null,
-                        localStats,
-                        instructionProfile
-                    );
-                    if (!latestCompleteness.needsMoreEvidence || !appRetriever || typeof appRetriever.retrieve !== 'function') break;
-
-                    const gapQueries = this.superBrainBuildGapDrivenQueries(query, latestModel, latestCompleteness);
-                    if (!gapQueries.length) break;
-
-                    const expansionChunks = [];
-                    for (const gapQuery of gapQueries) {
-                        try {
-                            const retrieved = await appRetriever.retrieve(gapQuery, null, {
-                                intent: {
-                                    ...(typeof appRetriever.detectQueryIntent === 'function'
-                                        ? appRetriever.detectQueryIntent(gapQuery)
-                                        : {}),
-                                    broadCoverage: true,
-                                    comparative: true
-                                }
-                            });
-                            expansionChunks.push(...(retrieved || []));
-                        } catch {
-                            // Keep stabilization loop resilient under partial retrieval failures.
-                        }
-                    }
-
-                    if (!expansionChunks.length) break;
-                    const merged = uniqBy(
-                        [...workingChunks, ...expansionChunks],
-                        item => item.id || `${item.filename}:${item.index || 0}:${item.page || 'na'}`
-                    );
-                    const nextDocCount = new Set(merged.map(item => item.filename)).size;
-                    const nextChunkCount = merged.length;
-                    const gapCount = Array.isArray(latestModel?.gaps) ? latestModel.gaps.length : 0;
-                    const docDelta = nextDocCount - prevDocCount;
-                    const chunkDelta = nextChunkCount - prevChunkCount;
-                    const gapDelta = prevGapCount === null ? null : Math.abs(gapCount - prevGapCount);
-                    if ((gapDelta !== null && gapDelta <= 1) && docDelta <= 0 && chunkDelta <= 2) {
-                        stableCycles += 1;
-                    } else {
-                        stableCycles = 0;
-                    }
-                    prevGapCount = gapCount;
-                    prevDocCount = nextDocCount;
-                    prevChunkCount = nextChunkCount;
-                    workingChunks = merged;
-
-                    if (appRetriever?.lastActivationReport) {
-                        localStats.activationReport = { ...appRetriever.lastActivationReport };
-                    }
-                    if (appRetriever?.lastFullCorpusSweep) {
-                        localStats.fullCorpusSweep = appRetriever.lastFullCorpusSweep;
-                    }
-                    if (stableCycles >= MODEL_STABILIZATION_REQUIRED) break;
-                }
-
-                return {
-                    stabilizedChunks: workingChunks,
-                    mentalModel: latestModel,
-                    completeness: latestCompleteness,
-                    passes,
-                    stabilized: stableCycles >= MODEL_STABILIZATION_REQUIRED
-                };
+                return uniqBy(out, item => normalizeConcept(item)).slice(0, MAX_GAP_REFINEMENT_QUERIES + 2);
             };
         }
 
@@ -952,50 +746,41 @@ ${evidenceDigest}`
             CognitiveSynthesizer.prototype.superBrainAssessEvidenceCompleteness = function superBrainAssessEvidenceCompleteness(
                 query,
                 sources = [],
+                model = null,
                 activationReport = {},
-                mentalModel = null,
-                diagnostics = null,
-                corpusStats = {},
                 instructionProfile = {}
             ) {
-                const dedupedSources = uniqBy(
+                const deduped = uniqBy(
                     sources || [],
                     item => item?.id || `${item?.filename || 'unknown'}:${item?.index || 0}:${item?.page || 'na'}`
                 );
-                const sourceCount = dedupedSources.length;
-                const docCount = new Set(dedupedSources.map(item => item.filename).filter(Boolean)).size;
-                const totalDocs = activationReport.totalDocuments || corpusStats.numDocs || docCount;
-                const broadScope = this.superBrainIsBroadScopeQuestion(query);
-                const requiredDocs = this.superBrainRequiredCrossSourceDocs(query, totalDocs, instructionProfile);
-                const gapCount = Array.isArray(mentalModel?.gaps) ? mentalModel.gaps.length : 0;
+                const sourceCount = deduped.length;
+                const docCount = new Set(deduped.map(item => item.filename).filter(Boolean)).size;
+                const totalDocs = activationReport.totalDocuments || docCount;
+                const broadOrDecision = !!instructionProfile?.decisionMode || /\b(overall|across|entire|comprehensive|compare|contrast|decision|recommend|trade-?off)\b/i.test(String(query || ''));
+                const requiredDocs = broadOrDecision ? (totalDocs >= 7 ? 3 : Math.min(totalDocs, MIN_CROSS_SOURCE_DOCS)) : 1;
                 const activationCoverage = activationReport.activationCoveragePct || 0;
+                const gapCount = Array.isArray(model?.gaps) ? model.gaps.length : 0;
 
                 const reasons = [];
-                if (sourceCount === 0) reasons.push('No retrievable evidence chunks were available for this query.');
+                if (sourceCount === 0) reasons.push('No retrievable evidence was found for the question.');
                 if (requiredDocs > 1 && docCount < requiredDocs) {
-                    reasons.push(`Question scope requires cross-source reasoning, but evidence currently covers only ${docCount}/${requiredDocs} required documents.`);
+                    reasons.push(`Cross-source coverage is insufficient (${docCount}/${requiredDocs} required documents).`);
                 }
-                if (broadScope && totalDocs >= 5 && activationCoverage > 0 && activationCoverage < 22) {
-                    reasons.push(`Activation coverage is low for a broad query (${activationCoverage}%).`);
+                if (broadOrDecision && totalDocs >= 5 && activationCoverage > 0 && activationCoverage < 22) {
+                    reasons.push(`Activation coverage remains low for a broad query (${activationCoverage}%).`);
                 }
-                if (gapCount >= 5 && docCount < 4) {
-                    reasons.push('Mental model still contains multiple unresolved evidence gaps.');
-                }
-                if (diagnostics && diagnostics.totalClaims >= 3 && diagnostics.claimSupportRatio < 0.24 && sourceCount <= Math.max(4, requiredDocs * 2)) {
-                    reasons.push('Claim support remains weak after synthesis/repair.');
+                if (gapCount >= MODEL_GAP_THRESHOLD && docCount < Math.max(2, requiredDocs)) {
+                    reasons.push('Mental model still has unresolved high-priority evidence gaps.');
                 }
 
                 const requestedDocuments = [];
-                if (sourceCount === 0) requestedDocuments.push(`Primary source documents directly covering: "${query}"`);
+                if (sourceCount === 0) requestedDocuments.push(`Primary source documents directly addressing: "${query}"`);
                 if (requiredDocs > 1 && docCount < requiredDocs) {
-                    requestedDocuments.push(`Additional independent documents are required to reach at least ${requiredDocs} source documents for reliable cross-source validation.`);
+                    requestedDocuments.push(`Additional relevant sources from at least ${requiredDocs} distinct documents are needed.`);
                 }
-                if (Array.isArray(mentalModel?.gaps) && mentalModel.gaps.length) {
-                    for (const gapRaw of mentalModel.gaps.slice(0, 5)) {
-                        const gap = String(gapRaw || '').replace(/^Insufficient direct evidence for concept:\s*/i, '').replace(/"/g, '').trim();
-                        if (!gap) continue;
-                        requestedDocuments.push(`Source material that explicitly addresses: ${gap}`);
-                    }
+                for (const gapRaw of (model?.gaps || []).slice(0, 5)) {
+                    requestedDocuments.push(`Source material that explicitly covers: ${String(gapRaw).replace(/^Insufficient direct evidence for concept:\s*/i, '').replace(/"/g, '').trim()}`);
                 }
 
                 return {
@@ -1005,76 +790,143 @@ ${evidenceDigest}`
                     totalDocs,
                     requiredDocs,
                     activationCoverage,
-                    reasons,
-                    requestedDocuments: uniqBy(requestedDocuments, item => item).slice(0, 8)
+                    reasons: uniqBy(reasons, item => item),
+                    requestedDocuments: uniqBy(requestedDocuments.filter(Boolean), item => item).slice(0, 8)
                 };
             };
         }
 
         if (typeof CognitiveSynthesizer.prototype.superBrainBuildMissingEvidenceResponse !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainBuildMissingEvidenceResponse = function superBrainBuildMissingEvidenceResponse(
-                query,
-                completeness,
-                sources = [],
-                mentalModel = null
-            ) {
+            CognitiveSynthesizer.prototype.superBrainBuildMissingEvidenceResponse = function superBrainBuildMissingEvidenceResponse(query, completeness, sources = [], model = null) {
                 const queryTokens = this.superBrainTokenize(query);
-                const evidenceLines = (sources || [])
-                    .slice(0, 4)
-                    .map(source => this.superBrainBuildCitationLine(source, queryTokens))
-                    .filter(Boolean);
-                const entities = (mentalModel?.entities || []).slice(0, 8).join(', ') || 'N/A';
-                const concepts = (mentalModel?.concepts || []).slice(0, 10).join(', ') || 'N/A';
-                const gaps = (mentalModel?.gaps || []).slice(0, 6);
-                const reasons = (completeness?.reasons || []).slice(0, 6);
-                const requested = (completeness?.requestedDocuments || []).slice(0, 8);
+                const evidenceLines = (sources || []).slice(0, 4).map(source => {
+                    const sentences = String(source.text || '').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+                    const sentence = sentences.find(s => queryTokens.some(token => safeLower(s).includes(token))) || sentences[0] || '';
+                    if (!sentence) return null;
+                    const cleaned = sentence.replace(/\s+/g, ' ').trim().slice(0, 210);
+                    const quote = cleaned.slice(0, 110).replace(/"/g, '\'');
+                    return `- ${cleaned} [Source: ${source.filename || 'Unknown'}, page ${source.page || 'N/A'}, "${quote || 'relevant quote'}"]`;
+                }).filter(Boolean);
 
                 const lines = [
                     '## Mental Model',
-                    '- Status: Incomplete for a reliable final answer.',
+                    '- Status: Incomplete for a reliable expert conclusion.',
                     `- Query focus: ${query}`,
-                    `- Currently grounded entities: ${entities}`,
-                    `- Currently grounded concepts: ${concepts}`,
+                    `- Current entities: ${(model?.entities || []).slice(0, 8).join(', ') || 'N/A'}`,
+                    `- Current concepts: ${(model?.concepts || []).slice(0, 10).join(', ') || 'N/A'}`,
                     '',
                     '## Evidence-Based Status',
-                    `- Reviewed source chunks: ${completeness?.sourceCount || 0}`,
-                    `- Reviewed documents: ${completeness?.docCount || 0}/${completeness?.totalDocs || 0}`,
+                    `- Source chunks reviewed: ${completeness?.sourceCount || 0}`,
+                    `- Distinct documents covered: ${completeness?.docCount || 0}/${completeness?.requiredDocs || 1} required`,
                     completeness?.activationCoverage ? `- Activation coverage: ${completeness.activationCoverage}%` : '- Activation coverage: N/A'
                 ];
-
                 if (evidenceLines.length) {
-                    lines.push('- Grounded evidence observed:');
+                    lines.push('- Current grounded evidence:');
                     lines.push(...evidenceLines);
                 } else {
-                    lines.push('- No citable evidence was retrieved for this specific request.');
+                    lines.push('- No citable evidence is currently available for this question.');
                 }
 
                 lines.push('', '## Uncertainties & Missing Information');
-                if (reasons.length) {
-                    lines.push(...reasons.map(reason => `- ${reason}`));
-                } else {
-                    lines.push('- Evidence remains insufficient for a high-confidence, source-grounded conclusion.');
-                }
-                if (gaps.length) {
-                    lines.push('- Open evidence gaps detected in the mental model:');
-                    lines.push(...gaps.map(gap => `- ${gap}`));
+                for (const reason of (completeness?.reasons || [])) lines.push(`- ${reason}`);
+                if (!completeness?.reasons?.length) lines.push('- Evidence is insufficient to produce a high-confidence answer.');
+                if (Array.isArray(model?.gaps) && model.gaps.length) {
+                    lines.push('- Open evidence gaps:');
+                    for (const gap of model.gaps.slice(0, 6)) lines.push(`- ${gap}`);
                 }
 
                 lines.push('', '## Required Documents/Data');
-                if (requested.length) {
-                    requested.forEach((item, idx) => lines.push(`${idx + 1}. ${item}`));
-                } else {
-                    lines.push('1. Additional authoritative source material that directly answers the unresolved parts of the query.');
-                }
+                const requested = completeness?.requestedDocuments || [];
+                if (requested.length) requested.forEach((item, idx) => lines.push(`${idx + 1}. ${item}`));
+                else lines.push('1. Additional source documents that directly answer unresolved parts of the question.');
                 lines.push('');
-                lines.push('Please provide the requested documents/data so I can complete a fully grounded, cross-source expert answer with precise citations.');
+                lines.push('Please provide the missing documents/data so I can complete a fully grounded, cross-source expert answer with precise citations.');
                 return lines.join('\n');
             };
         }
 
-        if (typeof CognitiveSynthesizer.prototype.superBrainBuildContinuitySafeHistory !== 'function') {
-            CognitiveSynthesizer.prototype.superBrainBuildContinuitySafeHistory = function superBrainBuildContinuitySafeHistory(history = []) {
-                return Array.isArray(history) ? history.slice(-12) : [];
+        if (typeof CognitiveSynthesizer.prototype.superBrainRunModelRefinementLoop !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainRunModelRefinementLoop = async function superBrainRunModelRefinementLoop(
+                query,
+                relevantChunks = [],
+                attachmentContext = null,
+                localStats = {},
+                instructionProfile = {}
+            ) {
+                const retriever = (typeof window !== 'undefined' && window.app?.retriever) ? window.app.retriever : null;
+                const broadOrDecision = !!instructionProfile?.decisionMode || /\b(overall|across|entire|comprehensive|compare|contrast|decision|recommend|trade-?off)\b/i.test(String(query || ''));
+                let chunks = uniqBy(relevantChunks || [], item => item.id || `${item.filename}:${item.index || 0}`);
+                let passes = 1;
+                let stableHits = 0;
+                let previousGapCount = null;
+                let model = null;
+                let completeness = null;
+
+                for (let cycle = 0; cycle < MAX_MODEL_REFINEMENT_PASSES; cycle++) {
+                    passes = cycle + 1;
+                    const sourcesForModel = uniqBy(
+                        [
+                            ...(attachmentContext?.chunks || []).map(item => ({ ...item, filename: attachmentContext?.name || item.filename || 'attachment' })),
+                            ...chunks
+                        ],
+                        item => item.id || `${item.filename}:${item.index || 0}:${item.page || 'na'}`
+                    ).slice(0, MAX_MENTAL_MODEL_SOURCES * 2);
+
+                    model = await this.superBrainBuildModel(query, chunks, attachmentContext, localStats);
+                    completeness = this.superBrainAssessEvidenceCompleteness(
+                        query,
+                        sourcesForModel,
+                        model,
+                        localStats.activationReport || {},
+                        instructionProfile
+                    );
+
+                    const gapCount = Array.isArray(model?.gaps) ? model.gaps.length : 0;
+                    const gapDelta = previousGapCount === null ? null : Math.abs(gapCount - previousGapCount);
+                    if (gapDelta !== null && gapDelta <= 1) stableHits += 1;
+                    else stableHits = 0;
+                    previousGapCount = gapCount;
+
+                    const shouldRetrieveAgain = completeness.needsMoreEvidence &&
+                        broadOrDecision &&
+                        retriever &&
+                        typeof retriever.retrieve === 'function' &&
+                        stableHits < 1;
+                    if (!shouldRetrieveAgain) break;
+
+                    const gapQueries = this.superBrainBuildGapDrivenQueries(query, model);
+                    if (!gapQueries.length) break;
+                    const expanded = [];
+                    for (const gapQuery of gapQueries.slice(0, MAX_GAP_REFINEMENT_QUERIES)) {
+                        try {
+                            const retrieved = await retriever.retrieve(gapQuery, null, {
+                                intent: {
+                                    ...(typeof retriever.detectQueryIntent === 'function' ? retriever.detectQueryIntent(gapQuery) : {}),
+                                    broadCoverage: true,
+                                    comparative: true
+                                }
+                            });
+                            expanded.push(...(retrieved || []));
+                        } catch {
+                            // keep loop resilient on transient retrieval failures
+                        }
+                    }
+                    if (!expanded.length) break;
+                    const merged = uniqBy([...chunks, ...expanded], item => item.id || `${item.filename}:${item.index || 0}`);
+                    if (merged.length <= chunks.length + 1) {
+                        stableHits += 1;
+                        if (stableHits >= 1) break;
+                    }
+                    chunks = merged;
+                }
+
+                return {
+                    chunks,
+                    model,
+                    completeness,
+                    passes,
+                    stabilized: stableHits >= 1
+                };
             };
         }
     }
@@ -1140,10 +992,10 @@ ${evidenceDigest}`
                 )
                 : uniqBy([...merged, ...conceptLinked], item => item.id);
 
-            const iterative = typeof this.applyIterativeRetrievalPasses === 'function'
-                ? await this.applyIterativeRetrievalPasses(retrievalQuery, merged, targetTopK, options, intent, original)
-                : { merged, passCount: 1, stabilized: false };
-            merged = iterative.merged;
+            const refinement = typeof this.superBrainRunRetrievalRefinement === 'function'
+                ? await this.superBrainRunRetrievalRefinement(retrievalQuery, merged, targetTopK, options, intent, original)
+                : { chunks: merged, passes: 1, stabilized: true };
+            merged = refinement.chunks;
 
             let ranked = merged;
             if (typeof this.shouldUseSemanticRerank === 'function'
@@ -1162,39 +1014,39 @@ ${evidenceDigest}`
                 }
             }
 
-            if (typeof this.enforceDocumentCoverage === 'function') {
-                ranked = this.enforceDocumentCoverage(ranked, anchors, targetTopK);
+            const spreadEnforced = typeof this.enforceDocumentCoverage === 'function'
+                ? this.enforceDocumentCoverage(ranked, anchors, targetTopK)
+                : ranked.slice(0, targetTopK);
+            let out = spreadEnforced.slice(0, targetTopK);
+            if (typeof this.superBrainDeepScanAugment === 'function') {
+                out = this.superBrainDeepScanAugment(retrievalQuery, out, targetTopK);
             }
 
-            const out = ranked.slice(0, targetTopK);
-            const outDocCount = new Set(out.map(item => item.filename)).size;
-            const requiresCrossSource = (
-                intent.broadCoverage ||
-                intent.comparative ||
-                intent.timeline ||
-                /\b(overall|across|enterprise|comprehensive|policy|strategy|trade-?off|decision|recommend)\b/i.test(String(query || ''))
-            );
-            const requiredDocs = requiresCrossSource
-                ? ((this.documents?.length || 0) >= 7 ? 3 : Math.min((this.documents?.length || 0), MIN_BROAD_SCOPE_DOCS))
+            const broadQuestion = intent.broadCoverage || intent.comparative || intent.timeline ||
+                /\b(overall|across|entire|comprehensive|strategy|decision|recommend|trade-?off)\b/i.test(String(query || ''));
+            const requiredDocs = broadQuestion
+                ? ((this.documents?.length || 0) >= 7 ? 3 : Math.min((this.documents?.length || 0), MIN_CROSS_SOURCE_DOCS))
                 : 1;
-            if (requiresCrossSource && (this.documents?.length || 0) >= MIN_BROAD_SCOPE_DOCS && outDocCount < requiredDocs) {
-                const extraAnchors = typeof this.getDocumentAnchors === 'function'
-                    ? this.getDocumentAnchors(`${retrievalQuery} cross-document evidence`, intent)
+            const currentDocs = new Set(out.map(item => item.filename).filter(Boolean));
+            if (broadQuestion && (this.documents?.length || 0) >= MIN_CROSS_SOURCE_DOCS && currentDocs.size < requiredDocs) {
+                const crossAnchors = typeof this.getDocumentAnchors === 'function'
+                    ? this.getDocumentAnchors(`${retrievalQuery} cross-source corroboration`, intent)
                     : [];
-                const seenDocNames = new Set(out.map(item => item.filename));
-                for (const anchor of extraAnchors) {
+                for (const anchor of crossAnchors) {
                     if (out.length >= targetTopK) break;
-                    if (out.some(item => item.id === anchor.id)) continue;
-                    if (seenDocNames.size < requiredDocs && seenDocNames.has(anchor.filename)) continue;
+                    if (!anchor?.id || out.some(item => item.id === anchor.id)) continue;
+                    if (currentDocs.size < requiredDocs && currentDocs.has(anchor.filename)) continue;
                     out.push(anchor);
-                    seenDocNames.add(anchor.filename);
+                    if (anchor.filename) currentDocs.add(anchor.filename);
                 }
             }
 
             if (typeof this.buildCorpusActivationReport === 'function') {
                 this.lastActivationReport = this.buildCorpusActivationReport(query, out);
-                this.lastActivationReport.retrievalPasses = iterative.passCount;
-                this.lastActivationReport.stabilized = !!iterative.stabilized;
+                this.lastActivationReport.retrievalPasses = refinement.passes || 1;
+                this.lastActivationReport.retrievalStabilized = !!refinement.stabilized;
+                this.lastActivationReport.requiredCrossSourceDocs = broadQuestion ? requiredDocs : 1;
+                this.lastActivationReport.currentCrossSourceDocs = new Set(out.map(item => item.filename)).size;
             }
 
             return out.slice(0, targetTopK);
@@ -1246,6 +1098,9 @@ ${evidenceDigest}`
                 '- Use only retrieved sources from this request.',
                 '- Do not use prior chat memory as evidence.',
                 '- Prior-turn memory is allowed only for conversational continuity (co-reference, follow-up scope, user preferences).',
+                '- Do not produce summary-only output; produce expert analysis, trade-offs, decisions, and actionable recommendations.',
+                '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
+                '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
                 '- Build an internal mental model before final answer:',
                 '  1) entities and concepts',
                 '  2) relationship graph',
@@ -1254,11 +1109,9 @@ ${evidenceDigest}`
                 '- Every factual sentence must include citation format exactly:',
                 '  [Source: filename, page X, "brief relevant quote"]',
                 '- Include a final section titled: "Uncertainties & Missing Information".',
-                '- For broad/comparative/decision questions, do not conclude from a single source; request missing documents if cross-source evidence is inadequate.',
-                '- If claim-level citation/support quality gates fail after repair attempts, do not finalize a confident answer; request the missing evidence explicitly.',
                 '',
                 'COGNITION PRIORS:',
-                '- Toyota Frontier Research on human-AI collaboration: https://global.toyota/en/mobility/frontier-research/43225436.html',
+                '- Toyota Frontier Research (human-like event understanding): https://global.toyota/en/mobility/frontier-research/43225436.html',
                 '- Nature (s41586-025-09215-4): https://www.nature.com/articles/s41586-025-09215-4',
                 ...COGNITION_PRIOR.map(item => `- ${item}`)
             ].join('\n');
@@ -1293,44 +1146,32 @@ ${evidenceDigest}`
                 };
             }
 
-            const appRetriever = (typeof window !== 'undefined' && window.app?.retriever) ? window.app.retriever : null;
-            if (appRetriever?.lastActivationReport) {
-                localStats.activationReport = { ...appRetriever.lastActivationReport };
-            }
-
-            const stabilization = await this.superBrainRunMentalModelStabilization(
+            const refinement = await this.superBrainRunModelRefinementLoop(
                 query,
                 relevantChunks || [],
                 attachmentContext,
                 localStats,
-                appRetriever,
                 requestProfile
             );
-            const stabilizedChunks = Array.isArray(stabilization?.stabilizedChunks)
-                ? stabilization.stabilizedChunks
+            const refinedChunks = Array.isArray(refinement?.chunks) && refinement.chunks.length
+                ? refinement.chunks
                 : (relevantChunks || []);
-            localStats.superBrainStabilization = {
-                passes: stabilization?.passes || 1,
-                stabilized: !!stabilization?.stabilized
+            localStats.superBrainRefinement = {
+                passes: refinement?.passes || 1,
+                stabilized: !!refinement?.stabilized
             };
-            if (appRetriever?.lastActivationReport) {
-                localStats.activationReport = { ...appRetriever.lastActivationReport };
-            }
-
-            const model = stabilization?.mentalModel || await this.superBrainBuildModel(query, stabilizedChunks, attachmentContext, localStats);
+            const model = refinement?.model || await this.superBrainBuildModel(query, refinedChunks, attachmentContext, localStats);
             localStats.superBrainMentalModel = model;
             localStats.superBrainMentalModelBlock = this.superBrainFormatModelBlock(model);
+            localStats.superBrainPreSynthesisCompleteness = refinement?.completeness || null;
 
             const historySnapshot = Array.isArray(this.conversationHistory) ? [...this.conversationHistory] : [];
-            const continuitySafeHistory = typeof this.superBrainBuildContinuitySafeHistory === 'function'
-                ? this.superBrainBuildContinuitySafeHistory(historySnapshot)
-                : historySnapshot;
-
+            const continuityHistory = historySnapshot.slice(-12);
             let result;
             let latestTurn = [];
             try {
-                this.conversationHistory = continuitySafeHistory;
-                result = await original.call(this, query, stabilizedChunks, attachmentContext, localStats);
+                this.conversationHistory = continuityHistory;
+                result = await original.call(this, query, refinedChunks, attachmentContext, localStats);
                 latestTurn = Array.isArray(this.conversationHistory) ? this.conversationHistory.slice(-2) : [];
             } finally {
                 this.conversationHistory = [...historySnapshot, ...latestTurn].slice(-40);
@@ -1346,6 +1187,9 @@ ${evidenceDigest}`
             let diagnostics = typeof this.buildClaimCitationDiagnostics === 'function'
                 ? this.buildClaimCitationDiagnostics(result.response, sources)
                 : null;
+            result.response = typeof this.superBrainNormalizeCitationSyntax === 'function'
+                ? this.superBrainNormalizeCitationSyntax(result.response)
+                : result.response;
             const missingUncertaintySection = !/uncertaint|missing information|evidence gap|cannot fully confirm/i.test(result.response);
             const minCitationTarget = sources.length >= 10 ? MIN_CITATIONS_FOR_RICH_CORPUS : sources.length >= 4 ? 2 : sources.length > 0 ? 1 : 0;
 
@@ -1365,9 +1209,10 @@ ${evidenceDigest}`
                     '2) Ensure claim-level citations across factual statements.',
                     '3) Include these sections:',
                     '   - Mental Model',
-                    '   - Evidence-Based Answer',
+                    '   - Evidence-Based Expert Analysis',
                     '   - Uncertainties & Missing Information',
-                    '4) Do not rely on prior chat memory or outside knowledge.'
+                    '4) Do not summarize only; provide reasoning, trade-offs, and recommendation when appropriate.',
+                    '5) Use prior chat memory only for continuity, never as factual evidence.'
                 ].join('\n');
                 const repaired = await this.verifyAndRepairAnswer(
                     query,
@@ -1377,7 +1222,9 @@ ${evidenceDigest}`
                     diagnostics
                 );
                 if (repaired?.trim()) {
-                    result.response = repaired.trim();
+                    result.response = typeof this.superBrainNormalizeCitationSyntax === 'function'
+                        ? this.superBrainNormalizeCitationSyntax(repaired.trim())
+                        : repaired.trim();
                     citationCount = typeof this.countCitations === 'function'
                         ? this.countCitations(result.response)
                         : citationCount;
@@ -1387,78 +1234,21 @@ ${evidenceDigest}`
                 }
             }
 
-            const profileForGate = result.meta?.instructionProfile || requestProfile;
-            let gate = typeof this.superBrainEvaluateCitationGate === 'function'
-                ? this.superBrainEvaluateCitationGate(query, result.response, diagnostics, profileForGate)
-                : { passed: true, reasons: [] };
-            let gateRepairAttempts = 0;
-            while (!gate.passed && gateRepairAttempts < MAX_CITATION_GATE_REPAIRS && typeof this.verifyAndRepairAnswer === 'function') {
-                const gateCtx = typeof this.formatContext === 'function'
-                    ? this.formatContext(sources || [], 12000).contextText
-                    : '';
-                const gateInstruction = [
-                    'STRICT QUALITY GATE REPAIR (MANDATORY):',
-                    '1) Every major claim must be citation-backed and source-supported.',
-                    '2) Keep these sections explicitly:',
-                    '   - Mental Model',
-                    '   - Evidence-Based Expert Answer',
-                    '   - Uncertainties & Missing Information',
-                    profileForGate?.decisionMode
-                        ? '3) Since this is a decision-oriented query, include: Options & Trade-offs and a source-grounded Recommendation.'
-                        : '3) Keep reasoning analytical and source-grounded (not summary-only).',
-                    `4) Fix these gate failures: ${(gate.reasons || []).join(' | ') || 'N/A'}`,
-                    '5) Do not use prior chat memory as factual evidence.'
-                ].join('\n');
-                const repairedGateAnswer = await this.verifyAndRepairAnswer(
-                    query,
-                    `${result.response}\n\n${gateInstruction}`,
-                    profileForGate,
-                    `## EVIDENCE\n${gateCtx}`,
-                    diagnostics
-                );
-                if (!repairedGateAnswer?.trim()) break;
-                result.response = repairedGateAnswer.trim();
-                citationCount = typeof this.countCitations === 'function'
-                    ? this.countCitations(result.response)
-                    : citationCount;
-                diagnostics = typeof this.buildClaimCitationDiagnostics === 'function'
-                    ? this.buildClaimCitationDiagnostics(result.response, sources)
-                    : diagnostics;
-                gate = typeof this.superBrainEvaluateCitationGate === 'function'
-                    ? this.superBrainEvaluateCitationGate(query, result.response, diagnostics, profileForGate)
-                    : gate;
-                gateRepairAttempts += 1;
-            }
-
-            let completeness = typeof this.superBrainAssessEvidenceCompleteness === 'function'
-                ? this.superBrainAssessEvidenceCompleteness(
-                    query,
-                    sources,
-                    localStats.activationReport || {},
-                    model,
-                    diagnostics,
-                    localStats,
-                    profileForGate
-                )
-                : { needsMoreEvidence: false };
-            if (!gate.passed) {
-                const gateIndicatesEvidenceGap = !!gate.evidenceFailure;
-                completeness = {
-                    ...completeness,
-                    needsMoreEvidence: completeness.needsMoreEvidence || gateIndicatesEvidenceGap,
-                    reasons: uniqBy([...(completeness.reasons || []), ...(gate.reasons || [])], item => item).slice(0, 10),
-                    requestedDocuments: gateIndicatesEvidenceGap
-                        ? uniqBy(
-                            [
-                                ...(completeness.requestedDocuments || []),
-                                'Provide additional primary source documents that directly support the currently unsupported major claims.'
-                            ],
-                            item => item
-                        ).slice(0, 10)
-                        : (completeness.requestedDocuments || [])
-                };
-            }
-            if (completeness.needsMoreEvidence && typeof this.superBrainBuildMissingEvidenceResponse === 'function') {
+            const profileForChecks = result.meta?.instructionProfile || requestProfile;
+            const completeness = this.superBrainAssessEvidenceCompleteness(
+                query,
+                sources,
+                model,
+                localStats.activationReport || {},
+                profileForChecks
+            );
+            const severeGapRisk = Array.isArray(model?.gaps) && model.gaps.length >= MODEL_GAP_THRESHOLD;
+            const shouldRequestMoreEvidence = completeness.needsMoreEvidence && (
+                sources.length === 0 ||
+                completeness.docCount < completeness.requiredDocs ||
+                (severeGapRisk && completeness.docCount < Math.max(2, completeness.requiredDocs))
+            );
+            if (shouldRequestMoreEvidence) {
                 result.response = this.superBrainBuildMissingEvidenceResponse(query, completeness, sources, model);
                 citationCount = typeof this.countCitations === 'function'
                     ? this.countCitations(result.response)
@@ -1476,10 +1266,8 @@ ${evidenceDigest}`
                     patchVersion: PATCH_VERSION,
                     activationReport: localStats.activationReport,
                     mentalModel: model,
-                    evidenceCompleteness: completeness,
-                    stabilization: localStats.superBrainStabilization,
-                    citationGatePassed: gate.passed,
-                    citationGateReasons: gate.reasons || []
+                    refinement: localStats.superBrainRefinement,
+                    evidenceCompleteness: completeness
                 }
             };
             return result;
@@ -1488,7 +1276,7 @@ ${evidenceDigest}`
         if (typeof UIController === 'function') {
             patchMethod(UIController, 'setSynthesisMessage', () => function patchedSetSynthesisMessage() {
                 if (this?.synthesisIndicatorText) {
-                    this.synthesisIndicatorText.textContent = 'Running iterative retrieval-model loops, enforcing claim-level citation gates, and checking for missing evidence...';
+                    this.synthesisIndicatorText.textContent = 'Interpreting intent, running corpus-wide semantic retrieval, building mental model, and validating citations...';
                 }
             });
 
