@@ -17,7 +17,7 @@
 (function superBrainRagPatch() {
     'use strict';
 
-    const PATCH_VERSION = '2026.02.11-superbrain-v2';
+    const PATCH_VERSION = '2026.02.11-superbrain-v3';
     const FULL_SWEEP_MIN_ANCHORS_PER_DOC = 2;
     const DEFAULT_TARGET_K_SMALL = 22;
     const DEFAULT_TARGET_K_MEDIUM = 30;
@@ -32,6 +32,9 @@
     const MAX_MODEL_REFINEMENT_PASSES = 3;
     const MODEL_GAP_THRESHOLD = 6;
     const MAX_GAP_REFINEMENT_QUERIES = 4;
+    const MAX_ANALYSIS_REWRITE_ATTEMPTS = 2;
+    const MIN_DECISION_REASONING_SIGNALS = 4;
+    const MIN_ANALYSIS_REASONING_SIGNALS = 2;
     const MIN_CROSS_SOURCE_DOCS = 2;
 
     const COGNITION_PRIOR = [
@@ -720,6 +723,163 @@ ${evidenceDigest}`
             };
         }
 
+        if (typeof CognitiveSynthesizer.prototype.superBrainNormalizeCitationSyntax !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainNormalizeCitationSyntax = function superBrainNormalizeCitationSyntax(text) {
+                let out = String(text || '');
+                if (!out) return out;
+                out = out.replace(/\[(source)\s*:/gi, '[Source:');
+                out = out.replace(/\(Source:\s*([^)]+)\)/gi, '[Source: $1]');
+                out = out.replace(/\[Source:\s*([^,\]\n]+)\s*,\s*"([^"]+)"\]/gi, '[Source: $1, page N/A, "$2"]');
+                out = out.replace(/\[Source:\s*([^,\]\n]+)\s*,\s*(?:page\s*)?([^,\]\n]+)\s*\]/gi, '[Source: $1, page $2, "citation excerpt unavailable"]');
+                return out;
+            };
+        }
+
+        if (typeof CognitiveSynthesizer.prototype.superBrainHasMalformedCitationPatterns !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainHasMalformedCitationPatterns = function superBrainHasMalformedCitationPatterns(text) {
+                const value = String(text || '');
+                if (!value) return false;
+                if (/\bCitations?:\s*\n/i.test(value) && !/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i.test(value)) {
+                    return true;
+                }
+                if (/\b[A-Za-z0-9._ -]+\.(?:pdf|docx|md)\s*\.\.\./i.test(value)) return true;
+                if (/\[Source:\s*[^\]]*$/m.test(value)) return true;
+                return false;
+            };
+        }
+
+        if (typeof CognitiveSynthesizer.prototype.superBrainExtractDistinctCitedDocs !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainExtractDistinctCitedDocs = function superBrainExtractDistinctCitedDocs(text) {
+                const value = String(text || '');
+                if (!value) return [];
+                let citations = [];
+                if (typeof this.extractCitations === 'function') {
+                    citations = this.extractCitations(value) || [];
+                } else {
+                    const regex = /\[Source:\s*([^,\]]+),\s*(?:page\s*)?([^,\]]+),\s*"([^"]+)"\]/gi;
+                    let match;
+                    while ((match = regex.exec(value)) !== null) {
+                        citations.push({ filename: String(match[1] || '').trim() });
+                    }
+                }
+                return uniqBy(
+                    citations.map(item => String(item?.filename || '').trim()).filter(Boolean),
+                    item => normalizeConcept(item)
+                );
+            };
+        }
+
+        if (typeof CognitiveSynthesizer.prototype.superBrainEvaluateCognitiveDepth !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainEvaluateCognitiveDepth = function superBrainEvaluateCognitiveDepth(
+                query,
+                responseText,
+                instructionProfile = {},
+                diagnostics = null,
+                sources = [],
+                activationReport = {}
+            ) {
+                const text = String(responseText || '');
+                const lower = safeLower(text);
+                const broadOrDecision = !!instructionProfile?.decisionMode || /\b(overall|across|entire|comprehensive|compare|contrast|decision|recommend|trade-?off)\b/i.test(String(query || ''));
+                const sourceDocCount = new Set((sources || []).map(item => item?.filename).filter(Boolean)).size;
+                const citedDocs = this.superBrainExtractDistinctCitedDocs(text);
+                const reasoningSignals = (lower.match(/\b(because|therefore|however|whereas|if|then|trade-?off|constraint|depends on|due to|implies|consequently|in turn)\b/g) || []).length;
+                const optionBulletSignals = (text.match(/^\s*(?:[-*]|\d+\.)\s+(?:option|approach|alternative|path|strategy)\b/gi) || []).length;
+                const optionLabelSignals = (text.match(/\boption\s*(?:1|2|3|a|b|c)\b/gi) || []).length;
+                const hasMentalModelSection = /(^|\n)\s*#{1,3}\s*mental model\b/i.test(text) || /\bmental model\b/i.test(lower);
+                const hasEvidenceSection = /(^|\n)\s*#{1,3}\s*(evidence-based expert analysis|evidence synthesis|evidence-based answer|evidence-based analysis)\b/i.test(text) || /\bevidence[- ]based\b/i.test(lower);
+                const hasUncertaintySection = /(^|\n)\s*#{1,3}\s*uncertainties?\s*&\s*missing information\b/i.test(text) || /uncertaint|missing information|evidence gap|cannot fully confirm/i.test(lower);
+                const minReasoningSignals = instructionProfile?.decisionMode ? MIN_DECISION_REASONING_SIGNALS : MIN_ANALYSIS_REASONING_SIGNALS;
+                const hasReasoningDepth = reasoningSignals >= minReasoningSignals;
+                const coverageTarget = typeof CLAIM_CITATION_TARGET === 'number' ? CLAIM_CITATION_TARGET : 0.55;
+                const precisionTarget = typeof CITATION_PRECISION_TARGET === 'number' ? CITATION_PRECISION_TARGET : 0.5;
+                const hasCitationCoverage = diagnostics ? (diagnostics.claimCitationCoverage || 0) >= Math.max(0.5, coverageTarget - 0.03) : true;
+                const hasCitationPrecision = diagnostics ? (diagnostics.citationPrecision || 0) >= Math.max(0.45, precisionTarget - 0.03) : true;
+                const crossSourceExpected = broadOrDecision && sourceDocCount >= MIN_CROSS_SOURCE_DOCS;
+                const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
+
+                const reasons = [];
+                if (!hasMentalModelSection) reasons.push('Missing explicit "Mental Model" section.');
+                if (!hasEvidenceSection) reasons.push('Missing explicit evidence-based analysis section.');
+                if (!hasUncertaintySection) reasons.push('Missing "Uncertainties & Missing Information" section.');
+                if (!hasReasoningDepth) reasons.push('Reasoning depth is weak (insufficient causal/trade-off signals).');
+                if (!hasCitationCoverage) reasons.push('Claim citation coverage is below required threshold.');
+                if (!hasCitationPrecision) reasons.push('Citation precision is below required threshold.');
+                if (!crossSourceSatisfied) reasons.push('Cross-source reasoning is weak (insufficient distinct cited documents).');
+
+                const decisionChecks = {
+                    hasOptionsTradeoffs: /(^|\n)\s*#{1,3}\s*(options?\s*&\s*trade-?offs?|trade-?offs?|options?)\b/i.test(text) || /trade-?off|option|alternative|pros|cons/i.test(lower),
+                    hasRecommendation: /(^|\n)\s*#{1,3}\s*recommendation\b/i.test(text) || /\brecommend(?:ed|ation)?\b/i.test(lower),
+                    hasRisks: /(^|\n)\s*#{1,3}\s*risks?\b/i.test(text) || /\brisk(s)?\b/i.test(lower),
+                    hasMultipleOptions: optionBulletSignals >= 2 || optionLabelSignals >= 2
+                };
+                if (instructionProfile?.decisionMode) {
+                    if (!decisionChecks.hasOptionsTradeoffs) reasons.push('Decision output missing "Options & Trade-offs".');
+                    if (!decisionChecks.hasRecommendation) reasons.push('Decision output missing explicit recommendation.');
+                    if (!decisionChecks.hasRisks) reasons.push('Decision output missing explicit risk analysis.');
+                    if (!decisionChecks.hasMultipleOptions) reasons.push('Decision output does not compare multiple concrete options.');
+                }
+
+                return {
+                    passed: reasons.length === 0,
+                    reasons,
+                    broadOrDecision,
+                    sourceDocCount,
+                    citedDocCount: citedDocs.length,
+                    citedDocs: citedDocs.slice(0, 8),
+                    reasoningSignals,
+                    minReasoningSignals,
+                    crossSourceExpected,
+                    crossSourceSatisfied,
+                    decisionChecks,
+                    activationCoverage: activationReport?.activationCoveragePct || 0
+                };
+            };
+        }
+
+        if (typeof CognitiveSynthesizer.prototype.superBrainBuildAnalyticalRewriteInstruction !== 'function') {
+            CognitiveSynthesizer.prototype.superBrainBuildAnalyticalRewriteInstruction = function superBrainBuildAnalyticalRewriteInstruction(
+                query,
+                instructionProfile = {},
+                depthGate = null,
+                sources = []
+            ) {
+                const sourceDocCount = new Set((sources || []).map(item => item?.filename).filter(Boolean)).size;
+                const decisionMode = !!instructionProfile?.decisionMode;
+                const minCitations = sourceDocCount >= 10 ? MIN_CITATIONS_FOR_RICH_CORPUS : (sourceDocCount >= 4 ? 2 : (sourceDocCount > 0 ? 1 : 0));
+                const lines = [
+                    'ANALYSIS-DEPTH REWRITE GATE (MANDATORY)',
+                    `Question: ${query}`,
+                    'Do NOT summarize. Produce expert reasoning with explicit inference and decisions where requested.',
+                    '',
+                    'Mandatory output scaffold:',
+                    '## Mental Model',
+                    '## Evidence-Based Expert Analysis'
+                ];
+                if (decisionMode) {
+                    lines.push('## Options & Trade-offs');
+                    lines.push('## Recommendation');
+                    lines.push('## Risks');
+                }
+                lines.push('## Uncertainties & Missing Information');
+                lines.push('');
+                lines.push(`Minimum citation target for this rewrite: ${minCitations} citations in exact format [Source: filename, page X, "brief relevant quote"].`);
+                if (sourceDocCount >= MIN_CROSS_SOURCE_DOCS) {
+                    lines.push(`Cross-source rule: cite at least ${Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount)} distinct source documents when giving broad or decision conclusions.`);
+                }
+                if (decisionMode) {
+                    lines.push('Decision rule: compare at least two concrete options with source-grounded trade-offs before recommending.');
+                }
+                const reasons = Array.isArray(depthGate?.reasons) ? depthGate.reasons.filter(Boolean) : [];
+                if (reasons.length) {
+                    lines.push('');
+                    lines.push('Fix these issues explicitly:');
+                    for (const reason of reasons.slice(0, 8)) lines.push(`- ${reason}`);
+                }
+                return lines.join('\n');
+            };
+        }
+
         if (typeof CognitiveSynthesizer.prototype.superBrainBuildGapDrivenQueries !== 'function') {
             CognitiveSynthesizer.prototype.superBrainBuildGapDrivenQueries = function superBrainBuildGapDrivenQueries(query, model = null) {
                 const out = [];
@@ -1058,6 +1218,34 @@ ${evidenceDigest}`
             return original.call(this, query, chunks, adjustedTopK, options);
         });
 
+        patchMethod(CognitiveSynthesizer, 'buildUserPrompt', (original) => function patchedBuildUserPrompt(query, instructionProfile = {}) {
+            const base = original.call(this, query, instructionProfile);
+            const format = instructionProfile?.requestedFormat || 'structured prose';
+            const decisionMode = !!instructionProfile?.decisionMode;
+            if (!decisionMode && !['structured prose', 'bullet list'].includes(format)) {
+                return base;
+            }
+            const scaffold = decisionMode
+                ? [
+                    'Mandatory cognitive scaffold for this answer:',
+                    '1) Mental Model',
+                    '2) Evidence-Based Expert Analysis',
+                    '3) Options & Trade-offs (at least 2 options)',
+                    '4) Recommendation',
+                    '5) Risks',
+                    '6) Uncertainties & Missing Information',
+                    'Do not output a summary-only response.'
+                ].join('\n')
+                : [
+                    'Mandatory cognitive scaffold for this answer:',
+                    '1) Mental Model',
+                    '2) Evidence-Based Expert Analysis',
+                    '3) Uncertainties & Missing Information',
+                    'Do not output a summary-only response.'
+                ].join('\n');
+            return `${base}\n\n${scaffold}`;
+        });
+
         patchMethod(CognitiveSynthesizer, 'buildInstructionProfile', (original) => function patchedBuildInstructionProfile(query) {
             const profile = original.call(this, query);
             const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle|policy approach)\b/i.test(String(query || ''));
@@ -1101,6 +1289,8 @@ ${evidenceDigest}`
                 '- Do not produce summary-only output; produce expert analysis, trade-offs, decisions, and actionable recommendations.',
                 '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
                 '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
+                '- Hard response scaffold for prose answers: Mental Model -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
+                '- For broad/decision queries, conclusions must be supported by multiple sources when available; do not rely on one dominant document.',
                 '- Build an internal mental model before final answer:',
                 '  1) entities and concepts',
                 '  2) relationship graph',
@@ -1181,22 +1371,38 @@ ${evidenceDigest}`
             if (!result || typeof result.response !== 'string') return result;
 
             const sources = Array.isArray(result.sources) ? result.sources : [];
+            result.response = typeof this.superBrainNormalizeCitationSyntax === 'function'
+                ? this.superBrainNormalizeCitationSyntax(result.response)
+                : result.response;
             let citationCount = typeof this.countCitations === 'function'
                 ? this.countCitations(result.response)
                 : 0;
             let diagnostics = typeof this.buildClaimCitationDiagnostics === 'function'
                 ? this.buildClaimCitationDiagnostics(result.response, sources)
                 : null;
-            result.response = typeof this.superBrainNormalizeCitationSyntax === 'function'
-                ? this.superBrainNormalizeCitationSyntax(result.response)
-                : result.response;
-            const missingUncertaintySection = !/uncertaint|missing information|evidence gap|cannot fully confirm/i.test(result.response);
+            let missingUncertaintySection = !/uncertaint|missing information|evidence gap|cannot fully confirm/i.test(result.response);
+            let malformedCitationSignals = typeof this.superBrainHasMalformedCitationPatterns === 'function'
+                ? this.superBrainHasMalformedCitationPatterns(result.response)
+                : false;
             const minCitationTarget = sources.length >= 10 ? MIN_CITATIONS_FOR_RICH_CORPUS : sources.length >= 4 ? 2 : sources.length > 0 ? 1 : 0;
+            const profileForChecks = result.meta?.instructionProfile || requestProfile;
+            let depthGate = typeof this.superBrainEvaluateCognitiveDepth === 'function'
+                ? this.superBrainEvaluateCognitiveDepth(
+                    query,
+                    result.response,
+                    profileForChecks,
+                    diagnostics,
+                    sources,
+                    localStats.activationReport || {}
+                )
+                : { passed: true, reasons: [] };
 
             const requiresAdditionalRepair = (
                 citationCount < minCitationTarget ||
                 missingUncertaintySection ||
-                (diagnostics && diagnostics.needsRepair)
+                malformedCitationSignals ||
+                (diagnostics && diagnostics.needsRepair) ||
+                !depthGate.passed
             );
 
             if (requiresAdditionalRepair && typeof this.verifyAndRepairAnswer === 'function') {
@@ -1212,7 +1418,8 @@ ${evidenceDigest}`
                     '   - Evidence-Based Expert Analysis',
                     '   - Uncertainties & Missing Information',
                     '4) Do not summarize only; provide reasoning, trade-offs, and recommendation when appropriate.',
-                    '5) Use prior chat memory only for continuity, never as factual evidence.'
+                    '5) Use prior chat memory only for continuity, never as factual evidence.',
+                    `6) Fix cognitive-depth gate failures: ${(depthGate?.reasons || []).slice(0, 6).join(' | ') || 'None detected'}.`
                 ].join('\n');
                 const repaired = await this.verifyAndRepairAnswer(
                     query,
@@ -1228,13 +1435,68 @@ ${evidenceDigest}`
                     citationCount = typeof this.countCitations === 'function'
                         ? this.countCitations(result.response)
                         : citationCount;
+                    missingUncertaintySection = !/uncertaint|missing information|evidence gap|cannot fully confirm/i.test(result.response);
+                    malformedCitationSignals = typeof this.superBrainHasMalformedCitationPatterns === 'function'
+                        ? this.superBrainHasMalformedCitationPatterns(result.response)
+                        : false;
                     diagnostics = typeof this.buildClaimCitationDiagnostics === 'function'
                         ? this.buildClaimCitationDiagnostics(result.response, sources)
                         : diagnostics;
+                    depthGate = typeof this.superBrainEvaluateCognitiveDepth === 'function'
+                        ? this.superBrainEvaluateCognitiveDepth(
+                            query,
+                            result.response,
+                            profileForChecks,
+                            diagnostics,
+                            sources,
+                            localStats.activationReport || {}
+                        )
+                        : depthGate;
                 }
             }
 
-            const profileForChecks = result.meta?.instructionProfile || requestProfile;
+            let depthRepairAttempts = 0;
+            while (!depthGate.passed && depthRepairAttempts < MAX_ANALYSIS_REWRITE_ATTEMPTS && typeof this.verifyAndRepairAnswer === 'function') {
+                const ctx = typeof this.formatContext === 'function'
+                    ? this.formatContext(sources || [], 13000).contextText
+                    : '';
+                const rewriteInstruction = typeof this.superBrainBuildAnalyticalRewriteInstruction === 'function'
+                    ? this.superBrainBuildAnalyticalRewriteInstruction(query, profileForChecks, depthGate, sources)
+                    : 'Rewrite with explicit mental model, evidence-based analysis, and uncertainties. Do not summarize.';
+                const repaired = await this.verifyAndRepairAnswer(
+                    query,
+                    `${result.response}\n\n${rewriteInstruction}`,
+                    profileForChecks,
+                    `## EVIDENCE\n${ctx}`,
+                    diagnostics
+                );
+                if (!repaired?.trim()) break;
+                result.response = typeof this.superBrainNormalizeCitationSyntax === 'function'
+                    ? this.superBrainNormalizeCitationSyntax(repaired.trim())
+                    : repaired.trim();
+                citationCount = typeof this.countCitations === 'function'
+                    ? this.countCitations(result.response)
+                    : citationCount;
+                missingUncertaintySection = !/uncertaint|missing information|evidence gap|cannot fully confirm/i.test(result.response);
+                malformedCitationSignals = typeof this.superBrainHasMalformedCitationPatterns === 'function'
+                    ? this.superBrainHasMalformedCitationPatterns(result.response)
+                    : false;
+                diagnostics = typeof this.buildClaimCitationDiagnostics === 'function'
+                    ? this.buildClaimCitationDiagnostics(result.response, sources)
+                    : diagnostics;
+                depthGate = typeof this.superBrainEvaluateCognitiveDepth === 'function'
+                    ? this.superBrainEvaluateCognitiveDepth(
+                        query,
+                        result.response,
+                        profileForChecks,
+                        diagnostics,
+                        sources,
+                        localStats.activationReport || {}
+                    )
+                    : depthGate;
+                depthRepairAttempts += 1;
+            }
+
             const completeness = this.superBrainAssessEvidenceCompleteness(
                 query,
                 sources,
@@ -1267,7 +1529,9 @@ ${evidenceDigest}`
                     activationReport: localStats.activationReport,
                     mentalModel: model,
                     refinement: localStats.superBrainRefinement,
-                    evidenceCompleteness: completeness
+                    evidenceCompleteness: completeness,
+                    cognitiveDepthGate: depthGate,
+                    cognitiveDepthRepairs: depthRepairAttempts
                 }
             };
             return result;

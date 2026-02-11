@@ -70,6 +70,15 @@ This repository now contains:
   - missing trade-off/decision reasoning,
   - hallucination-risk indicator.
 
+### 10) Hard anti-summarizer cognitive-depth gate
+- Adds a synthesis-time gate (not only post-hoc eval) that rejects summary-style responses.
+- Enforces mandatory expert reasoning structure:
+  - Mental Model
+  - Evidence-Based Expert Analysis
+  - (for decision queries) Options & Trade-offs, Recommendation, Risks
+  - Uncertainties & Missing Information
+- Runs iterative rewrite/repair passes when reasoning depth is weak, sections are missing, or cross-source decision reasoning is shallow.
+
 ---
 
 ## Nature paper inspiration
