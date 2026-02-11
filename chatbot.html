@@ -730,6 +730,36 @@
     const TPM_CONTEXT_TOKEN_BUDGET = 9500;
     const TPM_RETRY_CONTEXT_TOKEN_BUDGET = 7200;
     const MAP_PHASE_MAX_TOKENS = 420;
+    const HUMAN_BASELINE_METRICS = {
+        overall: 0.74,
+        coverage: 0.76,
+        citationCoverage: 0.72,
+        citationPrecision: 0.75,
+        instructionAdherence: 0.77,
+        decisionQuality: 0.71
+    };
+    const BENCHMARK_TASKS = [
+        {
+            id: 'bmk-1',
+            category: 'cross_source_decision',
+            query: 'Using all relevant uploaded sources, recommend a single course of action and justify it with cross-source trade-offs, risks, and constraints.'
+        },
+        {
+            id: 'bmk-2',
+            category: 'conflict_resolution',
+            query: 'Identify any conflicts or tensions across sources, explain the conflict drivers, and provide a reconciled interpretation with citations.'
+        },
+        {
+            id: 'bmk-3',
+            category: 'constraint_planning',
+            query: 'Build a constraint-aware plan from the corpus, including dependencies, exceptions, and failure modes, then propose mitigations.'
+        },
+        {
+            id: 'bmk-4',
+            category: 'gap_detection',
+            query: 'What cannot be concluded yet from the corpus, what evidence gaps remain, and which exact documents/data are required next?'
+        }
+    ];
 
     const REFUSAL_PATTERNS = [
         /cannot\s+(?:directly\s+)?access/i,
@@ -2711,15 +2741,22 @@ ${attachmentEvidence.contextText}`);
     }
 
     class QualityEvaluator {
-        constructor() { this.history = this.loadHistory(); }
-        loadHistory() {
-            const saved = localStorage.getItem('quality_eval_history');
+        constructor() {
+            this.history = this.loadList('quality_eval_history');
+            this.benchmarkHistory = this.loadList('quality_benchmark_history');
+            this.failureHistory = this.loadList('quality_failure_history');
+        }
+        loadList(key) {
+            const saved = localStorage.getItem(key);
             try { return saved ? JSON.parse(saved) : []; } catch { return []; }
         }
-        saveHistory() {
-            const trimmed = this.history.slice(-120);
-            localStorage.setItem('quality_eval_history', JSON.stringify(trimmed));
+        saveList(key, value, limit = 120) {
+            const trimmed = (value || []).slice(-limit);
+            localStorage.setItem(key, JSON.stringify(trimmed));
         }
+        saveHistory() { this.saveList('quality_eval_history', this.history, 240); }
+        saveBenchmarkHistory() { this.saveList('quality_benchmark_history', this.benchmarkHistory, 60); }
+        saveFailureHistory() { this.saveList('quality_failure_history', this.failureHistory, 360); }
         countCitations(text) {
             return (String(text || '').match(/\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/gi) || []).length;
         }
@@ -2747,25 +2784,111 @@ ${attachmentEvidence.contextText}`);
             const passed = checks.filter(Boolean).length;
             return passed / checks.length;
         }
+        evaluateDecisionQuality(query, response, claimDiagnostics = null) {
+            const text = String(response || '');
+            const lower = text.toLowerCase();
+            const decisionLikeQuery = /\b(recommend|decision|should|trade-?off|options?|strategy|action)\b/i.test(String(query || ''));
+            const checks = {
+                hasMentalModel: /mental model/i.test(text),
+                hasEvidenceReasoning: /evidence-based|evidence synthesis|because|therefore|trade-?off/i.test(lower),
+                hasOptionsOrTradeoffs: /trade-?off|options?|pros|cons|alternative/i.test(lower),
+                hasRecommendation: /recommend|recommended action|best option|decision/i.test(lower),
+                hasRiskOrUncertainty: /risk|uncertaint|missing information|assumption/i.test(lower),
+                hasActionability: /next steps|action plan|recommended action|^\s*\d+\.\s+/im.test(text),
+                hasSupportSignal: claimDiagnostics ? (claimDiagnostics.claimSupportRatio || 0) >= 0.36 : true
+            };
+            const required = decisionLikeQuery
+                ? ['hasMentalModel', 'hasEvidenceReasoning', 'hasOptionsOrTradeoffs', 'hasRecommendation', 'hasRiskOrUncertainty', 'hasActionability', 'hasSupportSignal']
+                : ['hasMentalModel', 'hasEvidenceReasoning', 'hasRiskOrUncertainty', 'hasSupportSignal'];
+            const passCount = required.filter(key => checks[key]).length;
+            const score = required.length ? (passCount / required.length) : 1;
+            return { score, checks, requiredChecks: required, decisionLikeQuery };
+        }
+        evaluateFailureRates(query, response, sources = [], diagnostics = {}, decisionQuality = null) {
+            const totalClaims = Math.max(0, diagnostics.totalClaims || 0);
+            const citedClaims = Math.max(0, diagnostics.citedClaims || 0);
+            const supportedClaims = Math.max(0, diagnostics.supportedClaims || 0);
+            const unsupportedClaimsRate = totalClaims ? (1 - (supportedClaims / totalClaims)) : 0;
+            const uncitedClaimsRate = totalClaims ? (1 - (citedClaims / totalClaims)) : 0;
+            const citationPrecision = Math.max(0, Math.min(1, diagnostics.citationPrecision || 0));
+            const citationErrorRate = 1 - citationPrecision;
+            const sourceCounts = new Map();
+            for (const source of sources || []) {
+                const name = String(source?.filename || 'unknown');
+                sourceCounts.set(name, (sourceCounts.get(name) || 0) + 1);
+            }
+            const totalSourceRefs = Array.from(sourceCounts.values()).reduce((sum, value) => sum + value, 0);
+            const dominantShare = totalSourceRefs > 0 ? (Math.max(...sourceCounts.values()) / totalSourceRefs) : 0;
+            const broadQuery = /\b(overall|across|entire|comprehensive|compare|contrast|multi|strategy|decision|trade-?off)\b/i.test(String(query || ''));
+            const sourceDominanceRisk = broadQuery ? dominantShare : 0;
+            const missingDecisionReasoning = !!decisionQuality?.decisionLikeQuery && (decisionQuality.score < 0.58);
+            const hallucinationRisk = (
+                unsupportedClaimsRate > 0.58 ||
+                (citationErrorRate > 0.7 && totalClaims >= 4) ||
+                (diagnostics.citationCount === 0 && totalClaims >= 3)
+            );
+            return {
+                unsupportedClaimsRate,
+                uncitedClaimsRate,
+                citationErrorRate,
+                sourceDominanceRisk,
+                missingDecisionReasoning,
+                hallucinationRisk
+            };
+        }
+        computeHumanBaselineDelta(metrics = {}) {
+            return {
+                overall: (metrics.overall || 0) - HUMAN_BASELINE_METRICS.overall,
+                coverage: (metrics.coverage || 0) - HUMAN_BASELINE_METRICS.coverage,
+                citationCoverage: (metrics.citationCoverage || 0) - HUMAN_BASELINE_METRICS.citationCoverage,
+                citationPrecision: (metrics.citationPrecision || 0) - HUMAN_BASELINE_METRICS.citationPrecision,
+                instructionAdherence: (metrics.instructionAdherence || 0) - HUMAN_BASELINE_METRICS.instructionAdherence,
+                decisionQuality: (metrics.decisionQuality || 0) - HUMAN_BASELINE_METRICS.decisionQuality
+            };
+        }
         evaluateTurn(query, response, sources = [], instructionProfile = {}, claimDiagnostics = null) {
             const diagnostics = claimDiagnostics || {
+                totalClaims: 0,
+                citedClaims: this.countCitations(response),
+                supportedClaims: sources.length > 0 ? 1 : 0,
                 claimCitationCoverage: this.countCitations(response) > 0 ? 0.75 : 0,
                 claimSupportRatio: sources.length > 0 ? 0.65 : 1,
-                citationPrecision: this.countCitations(response) > 0 ? 0.7 : 0
+                citationPrecision: this.countCitations(response) > 0 ? 0.7 : 0,
+                citationCount: this.countCitations(response)
             };
             const coverage = Math.max(0, Math.min(1, diagnostics.claimSupportRatio || 0));
             const citationCoverage = Math.max(0, Math.min(1, diagnostics.claimCitationCoverage || 0));
             const citationPrecision = Math.max(0, Math.min(1, diagnostics.citationPrecision || 0));
             const instructionAdherence = Math.max(0, Math.min(1, this.evaluateInstructionAdherence(response, instructionProfile, diagnostics)));
-            const overall = (coverage * 0.34 + citationCoverage * 0.22 + citationPrecision * 0.22 + instructionAdherence * 0.22);
+            const decisionQuality = this.evaluateDecisionQuality(query, response, diagnostics);
+            const decisionQualityScore = Math.max(0, Math.min(1, decisionQuality.score || 0));
+            const overall = (
+                coverage * 0.24 +
+                citationCoverage * 0.16 +
+                citationPrecision * 0.16 +
+                instructionAdherence * 0.16 +
+                decisionQualityScore * 0.28
+            );
+            const failures = this.evaluateFailureRates(query, response, sources, diagnostics, decisionQuality);
+            const metrics = { coverage, citationCoverage, citationPrecision, instructionAdherence, decisionQuality: decisionQualityScore, overall };
+            const baselineDelta = this.computeHumanBaselineDelta(metrics);
             const report = {
                 timestamp: new Date().toISOString(),
-                query: String(query || '').slice(0, 220),
-                metrics: { coverage, citationCoverage, citationPrecision, instructionAdherence, overall },
-                diagnostics
+                query: String(query || '').slice(0, 260),
+                metrics,
+                diagnostics,
+                decisionQuality,
+                failures,
+                baselineDelta
             };
             this.history.push(report);
             this.saveHistory();
+            this.failureHistory.push({
+                timestamp: report.timestamp,
+                query: report.query,
+                failures
+            });
+            this.saveFailureHistory();
             return report;
         }
         getRecentSummary(limit = 8) {
@@ -2776,18 +2899,216 @@ ${attachmentEvidence.contextText}`);
                 acc.citationCoverage += item.metrics.citationCoverage;
                 acc.citationPrecision += item.metrics.citationPrecision;
                 acc.instructionAdherence += item.metrics.instructionAdherence;
+                acc.decisionQuality += item.metrics.decisionQuality || 0;
                 acc.overall += item.metrics.overall;
                 return acc;
-            }, { coverage: 0, citationCoverage: 0, citationPrecision: 0, instructionAdherence: 0, overall: 0 });
+            }, { coverage: 0, citationCoverage: 0, citationPrecision: 0, instructionAdherence: 0, decisionQuality: 0, overall: 0 });
+            const averages = {
+                coverage: sum.coverage / recent.length,
+                citationCoverage: sum.citationCoverage / recent.length,
+                citationPrecision: sum.citationPrecision / recent.length,
+                instructionAdherence: sum.instructionAdherence / recent.length,
+                decisionQuality: sum.decisionQuality / recent.length,
+                overall: sum.overall / recent.length
+            };
+            return {
+                sampleSize: recent.length,
+                averages,
+                baselineDelta: this.computeHumanBaselineDelta(averages),
+                failureSummary: this.getFailureRateSummary(limit),
+                recent
+            };
+        }
+        getFailureRateSummary(limit = 30) {
+            const recent = this.failureHistory.slice(-limit);
+            if (!recent.length) return null;
+            const sum = recent.reduce((acc, item) => {
+                const f = item.failures || {};
+                acc.unsupportedClaimsRate += f.unsupportedClaimsRate || 0;
+                acc.uncitedClaimsRate += f.uncitedClaimsRate || 0;
+                acc.citationErrorRate += f.citationErrorRate || 0;
+                acc.sourceDominanceRisk += f.sourceDominanceRisk || 0;
+                acc.missingDecisionReasoning += f.missingDecisionReasoning ? 1 : 0;
+                acc.hallucinationRisk += f.hallucinationRisk ? 1 : 0;
+                return acc;
+            }, {
+                unsupportedClaimsRate: 0,
+                uncitedClaimsRate: 0,
+                citationErrorRate: 0,
+                sourceDominanceRisk: 0,
+                missingDecisionReasoning: 0,
+                hallucinationRisk: 0
+            });
             return {
                 sampleSize: recent.length,
                 averages: {
-                    coverage: sum.coverage / recent.length,
-                    citationCoverage: sum.citationCoverage / recent.length,
-                    citationPrecision: sum.citationPrecision / recent.length,
-                    instructionAdherence: sum.instructionAdherence / recent.length,
-                    overall: sum.overall / recent.length
-                },
+                    unsupportedClaimsRate: sum.unsupportedClaimsRate / recent.length,
+                    uncitedClaimsRate: sum.uncitedClaimsRate / recent.length,
+                    citationErrorRate: sum.citationErrorRate / recent.length,
+                    sourceDominanceRisk: sum.sourceDominanceRisk / recent.length,
+                    missingDecisionReasoningRate: sum.missingDecisionReasoning / recent.length,
+                    hallucinationRiskRate: sum.hallucinationRisk / recent.length
+                }
+            };
+        }
+        buildBenchmarkTaskPack(documents = []) {
+            const names = (documents || []).map(doc => doc.filename).filter(Boolean).slice(0, 5);
+            const scopeHint = names.length
+                ? `Focus cross-source reasoning across these corpus files when relevant: ${names.join(', ')}.`
+                : 'Focus cross-source reasoning across all uploaded corpus files.';
+            return BENCHMARK_TASKS.map(task => ({
+                ...task,
+                query: `${task.query}\n\n${scopeHint}`
+            }));
+        }
+        async evaluateRecallCoverageForQuery(retriever, query, expectedMinDocs = 2) {
+            if (!retriever || typeof retriever.retrieve !== 'function') return null;
+            const retrieved = await retriever.retrieve(query, null, {
+                intent: { broadCoverage: true, comparative: true }
+            });
+            const docs = new Set((retrieved || []).map(chunk => chunk.filename).filter(Boolean));
+            const perDocCount = new Map();
+            for (const chunk of (retrieved || [])) {
+                const filename = String(chunk?.filename || 'unknown');
+                perDocCount.set(filename, (perDocCount.get(filename) || 0) + 1);
+            }
+            const totalRefs = Array.from(perDocCount.values()).reduce((sum, n) => sum + n, 0);
+            const dominantShare = totalRefs ? (Math.max(...perDocCount.values()) / totalRefs) : 0;
+            const totalDocs = retriever.documents?.length || 0;
+            const coveragePct = totalDocs ? ((docs.size / totalDocs) * 100) : 0;
+            const pass = docs.size >= Math.min(expectedMinDocs, Math.max(1, totalDocs));
+            return {
+                query,
+                retrievedChunks: (retrieved || []).length,
+                distinctDocs: docs.size,
+                totalDocs,
+                coveragePct,
+                dominantShare,
+                pass
+            };
+        }
+        async runRecallCoverageValidation(retriever, tasks = []) {
+            const checks = [];
+            for (const task of tasks) {
+                try {
+                    const check = await this.evaluateRecallCoverageForQuery(retriever, task.query, 2);
+                    if (check) checks.push({ taskId: task.id, category: task.category, ...check });
+                } catch (error) {
+                    checks.push({
+                        taskId: task.id,
+                        category: task.category,
+                        query: task.query,
+                        error: String(error?.message || error)
+                    });
+                }
+            }
+            const valid = checks.filter(item => typeof item.pass === 'boolean');
+            const passRate = valid.length ? (valid.filter(item => item.pass).length / valid.length) : 0;
+            const avgCoveragePct = valid.length
+                ? (valid.reduce((sum, item) => sum + (item.coveragePct || 0), 0) / valid.length)
+                : 0;
+            const avgDominantShare = valid.length
+                ? (valid.reduce((sum, item) => sum + (item.dominantShare || 0), 0) / valid.length)
+                : 0;
+            return {
+                checks,
+                passRate,
+                avgCoveragePct,
+                avgDominantShare,
+                sampleSize: valid.length
+            };
+        }
+        async runBenchmarkSuite(executeTask, retriever, documents = []) {
+            const tasks = this.buildBenchmarkTaskPack(documents);
+            const recallValidation = await this.runRecallCoverageValidation(retriever, tasks);
+            const taskReports = [];
+            for (const task of tasks) {
+                try {
+                    const result = await executeTask(task);
+                    const turnReport = this.evaluateTurn(
+                        task.query,
+                        result.response,
+                        result.sources || [],
+                        result.meta?.instructionProfile || {},
+                        result.meta?.claimDiagnostics || null
+                    );
+                    taskReports.push({
+                        taskId: task.id,
+                        category: task.category,
+                        query: task.query,
+                        metrics: turnReport.metrics,
+                        failures: turnReport.failures,
+                        baselineDelta: turnReport.baselineDelta
+                    });
+                } catch (error) {
+                    taskReports.push({
+                        taskId: task.id,
+                        category: task.category,
+                        query: task.query,
+                        error: String(error?.message || error)
+                    });
+                }
+            }
+            const valid = taskReports.filter(item => item.metrics);
+            const avgMetrics = valid.length ? valid.reduce((acc, item) => {
+                acc.coverage += item.metrics.coverage || 0;
+                acc.citationCoverage += item.metrics.citationCoverage || 0;
+                acc.citationPrecision += item.metrics.citationPrecision || 0;
+                acc.instructionAdherence += item.metrics.instructionAdherence || 0;
+                acc.decisionQuality += item.metrics.decisionQuality || 0;
+                acc.overall += item.metrics.overall || 0;
+                return acc;
+            }, { coverage: 0, citationCoverage: 0, citationPrecision: 0, instructionAdherence: 0, decisionQuality: 0, overall: 0 }) : null;
+            const averages = valid.length ? {
+                coverage: avgMetrics.coverage / valid.length,
+                citationCoverage: avgMetrics.citationCoverage / valid.length,
+                citationPrecision: avgMetrics.citationPrecision / valid.length,
+                instructionAdherence: avgMetrics.instructionAdherence / valid.length,
+                decisionQuality: avgMetrics.decisionQuality / valid.length,
+                overall: avgMetrics.overall / valid.length
+            } : null;
+            const failureSummary = this.getFailureRateSummary(Math.max(20, valid.length));
+            const report = {
+                timestamp: new Date().toISOString(),
+                sampleSize: valid.length,
+                tasks: taskReports,
+                recallValidation,
+                averages,
+                baselineDelta: averages ? this.computeHumanBaselineDelta(averages) : null,
+                failureSummary
+            };
+            this.benchmarkHistory.push(report);
+            this.saveBenchmarkHistory();
+            return report;
+        }
+        getBenchmarkSummary(limit = 5) {
+            const recent = this.benchmarkHistory.slice(-limit);
+            if (!recent.length) return null;
+            const valid = recent.filter(item => item.averages);
+            if (!valid.length) return null;
+            const avg = valid.reduce((acc, item) => {
+                acc.coverage += item.averages.coverage;
+                acc.citationCoverage += item.averages.citationCoverage;
+                acc.citationPrecision += item.averages.citationPrecision;
+                acc.instructionAdherence += item.averages.instructionAdherence;
+                acc.decisionQuality += item.averages.decisionQuality;
+                acc.overall += item.averages.overall;
+                acc.recallPassRate += item.recallValidation?.passRate || 0;
+                return acc;
+            }, { coverage: 0, citationCoverage: 0, citationPrecision: 0, instructionAdherence: 0, decisionQuality: 0, overall: 0, recallPassRate: 0 });
+            const averages = {
+                coverage: avg.coverage / valid.length,
+                citationCoverage: avg.citationCoverage / valid.length,
+                citationPrecision: avg.citationPrecision / valid.length,
+                instructionAdherence: avg.instructionAdherence / valid.length,
+                decisionQuality: avg.decisionQuality / valid.length,
+                overall: avg.overall / valid.length,
+                recallPassRate: avg.recallPassRate / valid.length
+            };
+            return {
+                sampleSize: valid.length,
+                averages,
+                baselineDelta: this.computeHumanBaselineDelta(averages),
                 recent
             };
         }
@@ -3040,6 +3361,47 @@ ${attachmentEvidence.contextText}`);
                 : this.defaultSynthesisText;
         }
 
+        buildCorpusStats(query, relevantChunks, intent = {}) {
+            const relevantFilenames = new Set((relevantChunks || []).map(chunk => chunk.filename));
+            const documentMemories = this.retriever.documents
+                .filter(doc => relevantFilenames.has(doc.filename))
+                .slice(0, 10)
+                .map(doc => ({ filename: doc.filename, memory: doc.memory }));
+            return {
+                numDocs: this.retriever.documents.length,
+                numChunks: this.retriever.allChunks.length,
+                connectedConcepts: this.retriever.getTopConnectedConcepts(10),
+                documentMemories,
+                corpusDigest: intent?.broadCoverage ? this.retriever.buildCorpusDigest(query, relevantChunks, 16) : ''
+            };
+        }
+
+        async executeEvaluationTask(task) {
+            const query = String(task?.query || '').trim();
+            if (!query) throw new Error('Benchmark task query is empty.');
+            if (!this.synthesizer.apiKey) throw new Error('API key not configured for benchmark execution.');
+            if (!this.retriever.allChunks.length) throw new Error('No corpus documents available for benchmark execution.');
+
+            const historySnapshot = Array.isArray(this.synthesizer.conversationHistory)
+                ? [...this.synthesizer.conversationHistory]
+                : [];
+            const memorySnapshot = Array.isArray(this.synthesizer.workingMemory)
+                ? [...this.synthesizer.workingMemory]
+                : [];
+
+            try {
+                const intent = this.retriever.detectQueryIntent(query);
+                const relevantChunks = await this.retriever.retrieve(query, null, { intent: { ...intent, broadCoverage: true, comparative: true } });
+                const corpusStats = this.buildCorpusStats(query, relevantChunks, { ...intent, broadCoverage: true });
+                return await this.synthesizer.synthesize(query, relevantChunks, null, corpusStats);
+            } finally {
+                this.synthesizer.conversationHistory = historySnapshot.slice(-40);
+                if (typeof this.synthesizer.saveChatHistory === 'function') this.synthesizer.saveChatHistory();
+                this.synthesizer.workingMemory = memorySnapshot.slice(-18);
+                if (typeof this.synthesizer.saveWorkingMemory === 'function') this.synthesizer.saveWorkingMemory();
+            }
+        }
+
         async sendMessage() {
             const query = this.chatInput.value.trim();
             if (!query) return;
@@ -3087,19 +3449,7 @@ ${attachmentEvidence.contextText}`);
                     };
                 }
 
-                const relevantFilenames = new Set(relevantChunks.map(chunk => chunk.filename));
-                const documentMemories = this.retriever.documents
-                    .filter(doc => relevantFilenames.has(doc.filename))
-                    .slice(0, 10)
-                    .map(doc => ({ filename: doc.filename, memory: doc.memory }));
-
-                const corpusStats = {
-                    numDocs: this.retriever.documents.length,
-                    numChunks: this.retriever.allChunks.length,
-                    connectedConcepts: this.retriever.getTopConnectedConcepts(10),
-                    documentMemories,
-                    corpusDigest: intent.broadCoverage ? this.retriever.buildCorpusDigest(query, relevantChunks, 16) : ''
-                };
+                const corpusStats = this.buildCorpusStats(query, relevantChunks, intent);
 
                 const result = await this.synthesizer.synthesize(query, relevantChunks, attachmentContext, corpusStats);
                 this.addMessage(result.response, 'assistant', result.sources);
@@ -3116,7 +3466,7 @@ ${attachmentEvidence.contextText}`);
                     const toastType = evaluation.metrics.overall >= 0.82 ? 'success'
                         : evaluation.metrics.overall >= 0.65 ? 'info' : 'warning';
                     this.showToast(
-                        `Eval ${scorePct}% (coverage ${(evaluation.metrics.coverage * 100).toFixed(0)}%, citations ${(evaluation.metrics.citationPrecision * 100).toFixed(0)}%)`,
+                        `Eval ${scorePct}% (coverage ${(evaluation.metrics.coverage * 100).toFixed(0)}%, decision ${(evaluation.metrics.decisionQuality * 100).toFixed(0)}%, citations ${(evaluation.metrics.citationPrecision * 100).toFixed(0)}%)`,
                         toastType
                     );
                 }
@@ -3130,23 +3480,73 @@ ${attachmentEvidence.contextText}`);
             }
         }
 
-        runEvaluationHarness() {
-            const summary = this.evaluator?.getRecentSummary(10);
-            if (!summary) {
-                this.showToast('No evaluation data yet. Ask at least one question first.', 'warning');
+        async runEvaluationHarness() {
+            if (!this.evaluator) {
+                this.showToast('Evaluator unavailable.', 'error');
                 return;
             }
-            const avg = summary.averages;
-            const message = [
-                `Eval Harness (last ${summary.sampleSize} turns):`,
-                `Overall ${(avg.overall * 100).toFixed(1)}%`,
-                `Coverage ${(avg.coverage * 100).toFixed(1)}%`,
-                `Claim citation coverage ${(avg.citationCoverage * 100).toFixed(1)}%`,
-                `Citation precision ${(avg.citationPrecision * 100).toFixed(1)}%`,
-                `Instruction adherence ${(avg.instructionAdherence * 100).toFixed(1)}%`
-            ].join(' | ');
-            this.addMessage(message, 'system');
-            this.showToast(`Eval harness completed: ${(avg.overall * 100).toFixed(1)}% overall`, 'info');
+            if (!this.retriever.documents.length) {
+                this.showToast('Upload corpus documents before running benchmark harness.', 'warning');
+                return;
+            }
+
+            const rollingSummary = this.evaluator.getRecentSummary(12);
+            this.synthesisIndicator.classList.add('active');
+            this.synthesisIndicatorText.textContent = 'Running benchmark suite, recall/coverage validation, and failure-rate tracking...';
+
+            try {
+                let benchmarkReport = null;
+                let recallOnlyReport = null;
+                if (this.synthesizer.apiKey) {
+                    benchmarkReport = await this.evaluator.runBenchmarkSuite(
+                        (task) => this.executeEvaluationTask(task),
+                        this.retriever,
+                        this.retriever.documents
+                    );
+                } else {
+                    const tasks = this.evaluator.buildBenchmarkTaskPack(this.retriever.documents);
+                    recallOnlyReport = await this.evaluator.runRecallCoverageValidation(this.retriever, tasks);
+                }
+
+                const lines = [];
+                lines.push('Benchmark Harness Results');
+                lines.push('---');
+
+                if (rollingSummary) {
+                    const avg = rollingSummary.averages;
+                    lines.push(`Live turns (${rollingSummary.sampleSize}): overall ${(avg.overall * 100).toFixed(1)}%, decision ${(avg.decisionQuality * 100).toFixed(1)}%, citation precision ${(avg.citationPrecision * 100).toFixed(1)}%.`);
+                    if (rollingSummary.baselineDelta) {
+                        lines.push(`Vs human baseline: overall ${(rollingSummary.baselineDelta.overall * 100).toFixed(1)} pts, decision ${(rollingSummary.baselineDelta.decisionQuality * 100).toFixed(1)} pts.`);
+                    }
+                } else {
+                    lines.push('Live turns: no prior turn-evaluation history.');
+                }
+
+                if (benchmarkReport) {
+                    const avg = benchmarkReport.averages || {};
+                    const recall = benchmarkReport.recallValidation || {};
+                    const fail = benchmarkReport.failureSummary?.averages || {};
+                    lines.push(`Benchmark tasks executed: ${benchmarkReport.sampleSize}/${BENCHMARK_TASKS.length}.`);
+                    lines.push(`Recall/coverage validation: pass ${(Number(recall.passRate || 0) * 100).toFixed(1)}%, avg corpus coverage ${Number(recall.avgCoveragePct || 0).toFixed(1)}%, dominant-source share ${(Number(recall.avgDominantShare || 0) * 100).toFixed(1)}%.`);
+                    lines.push(`Expert-quality metrics: overall ${(Number(avg.overall || 0) * 100).toFixed(1)}%, decision ${(Number(avg.decisionQuality || 0) * 100).toFixed(1)}%, coverage ${(Number(avg.coverage || 0) * 100).toFixed(1)}%, citation precision ${(Number(avg.citationPrecision || 0) * 100).toFixed(1)}%.`);
+                    if (benchmarkReport.baselineDelta) {
+                        lines.push(`Against human baseline: overall ${(benchmarkReport.baselineDelta.overall * 100).toFixed(1)} pts, decision ${(benchmarkReport.baselineDelta.decisionQuality * 100).toFixed(1)} pts, coverage ${(benchmarkReport.baselineDelta.coverage * 100).toFixed(1)} pts.`);
+                    }
+                    lines.push(`Failure rates: unsupported claims ${(Number(fail.unsupportedClaimsRate || 0) * 100).toFixed(1)}%, uncited claims ${(Number(fail.uncitedClaimsRate || 0) * 100).toFixed(1)}%, hallucination risk ${(Number(fail.hallucinationRiskRate || 0) * 100).toFixed(1)}%, missing decision reasoning ${(Number(fail.missingDecisionReasoningRate || 0) * 100).toFixed(1)}%.`);
+                } else if (recallOnlyReport) {
+                    lines.push('Benchmark text generation skipped: configure API key to run full benchmark suite.');
+                    lines.push(`Recall/coverage-only validation: pass ${(Number(recallOnlyReport.passRate || 0) * 100).toFixed(1)}%, avg corpus coverage ${Number(recallOnlyReport.avgCoveragePct || 0).toFixed(1)}%, dominant-source share ${(Number(recallOnlyReport.avgDominantShare || 0) * 100).toFixed(1)}%.`);
+                }
+
+                this.addMessage(lines.join(' '), 'system');
+                this.showToast('Benchmark harness completed successfully.', 'info');
+            } catch (error) {
+                this.addMessage(`Benchmark harness error: ${this.escapeHtml(error.message || String(error))}`, 'system');
+                this.showToast(`Benchmark harness failed: ${error.message || error}`, 'error');
+            } finally {
+                this.synthesisIndicator.classList.remove('active');
+                this.setSynthesisMessage(false);
+            }
         }
 
         escapeHtml(text) {

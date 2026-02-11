@@ -32,10 +32,10 @@ This repository now contains:
   - evidence gaps
 - Injects this model into the system context before final answer generation.
 
-### 4) Strict fresh-pass RAG behavior
-- Enforces source-only answering.
-- Excludes prior chat memory from reasoning pass (fresh build per question).
-- Adds stronger prompt constraints to avoid hidden-knowledge style responses.
+### 4) Strict evidence-grounded RAG behavior
+- Enforces source-only factual grounding.
+- Preserves continuity-safe session context for reference resolution.
+- Prevents prior assistant turns from being treated as factual evidence.
 
 ### 5) Stronger claim/citation repair
 - Adds an extra repair trigger if citation density is low, uncertainty handling is missing, or claim diagnostics indicate weak grounding.
@@ -57,6 +57,18 @@ This repository now contains:
 - Adds a stricter claim-level gate (citation coverage, support ratio, citation precision, and required section checks).
 - Attempts automatic repair when gate checks fail.
 - If gate failures persist, the assistant refuses to over-claim and asks for specific missing evidence/documents.
+
+### 9) Benchmark + reliability evaluation harness
+- Adds expert-style benchmark tasks across cognitive categories (cross-source decisions, conflict resolution, constraint planning, gap detection).
+- Adds recall/coverage validation over large corpora (distinct-doc spread, coverage %, dominant-source concentration).
+- Adds decision-quality scoring and comparison against configurable human baseline metrics.
+- Tracks failure rates directly:
+  - unsupported claims,
+  - uncited claims,
+  - citation errors,
+  - source-dominance risk,
+  - missing trade-off/decision reasoning,
+  - hallucination-risk indicator.
 
 ---
 
