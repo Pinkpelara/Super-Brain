@@ -53,6 +53,11 @@ This repository now contains:
 - Keeps conversational continuity for follow-up references.
 - Prevents prior assistant turns from becoming factual evidence in fresh reasoning passes.
 
+### 8) Hard citation/structure quality gate
+- Adds a stricter claim-level gate (citation coverage, support ratio, citation precision, and required section checks).
+- Attempts automatic repair when gate checks fail.
+- If gate failures persist, the assistant refuses to over-claim and asks for specific missing evidence/documents.
+
 ---
 
 ## Nature paper inspiration
