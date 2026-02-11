@@ -81,6 +81,17 @@ This repository now contains:
 - Requires explicit heuristic/bias checks and mitigation notes to reduce shallow one-shot conclusions.
 - Runs iterative rewrite/repair passes when reasoning depth is weak, sections are missing, or cross-source decision reasoning is shallow.
 
+### 11) Adversarial + structured analytical reasoning
+- Adds adversarial retrieval ("devil's advocate") passes that actively search for contradictory/limiting evidence.
+- Forces inclusion of an explicit contradiction line in final reasoning:
+  - `While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation].`
+- Requires structured analytical frameworks and logic skeleton sections:
+  - Analytical Framework
+  - Explicitly Stated Facts
+  - Inferred Implications
+  - Perspective Analysis (when stakeholder conflicts are relevant)
+- Adds perspective-taking evidence maps to simulate multi-stakeholder viewpoints in policy/decision questions.
+
 ---
 
 ## Nature paper inspiration
