@@ -35,6 +35,8 @@
     const MAX_ANALYSIS_REWRITE_ATTEMPTS = 2;
     const MIN_DECISION_REASONING_SIGNALS = 4;
     const MIN_ANALYSIS_REASONING_SIGNALS = 2;
+    const MIN_HUMAN_COGNITION_STAGE_SIGNALS = 4;
+    const MIN_HUMAN_COGNITION_STAGE_SIGNALS_DECISION = 5;
     const MIN_CROSS_SOURCE_DOCS = 2;
 
     const COGNITION_PRIOR = [
@@ -797,6 +799,32 @@ ${evidenceDigest}`
                 const hasCitationPrecision = diagnostics ? (diagnostics.citationPrecision || 0) >= Math.max(0.45, precisionTarget - 0.03) : true;
                 const crossSourceExpected = broadOrDecision && sourceDocCount >= MIN_CROSS_SOURCE_DOCS;
                 const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
+                const stageChecks = {
+                    hasAttentionFilter: /\b(attention|salien|prioriti|signal-to-noise|noise filtering|filtering)\b/i.test(lower),
+                    hasPerceptionInterpretation: /\b(perception|interpret|contextual|context interpretation|sensemaking|meaning)\b/i.test(lower),
+                    hasDualProcess: /\b(system\s*1|system\s*2|fast thinking|slow thinking|heuristic|analytical pass|deliberate)\b/i.test(lower),
+                    hasDecisionStep: /\b(decision|recommend|choose|option|trade-?off)\b/i.test(lower),
+                    hasActionStep: /\b(action|next steps?|execution|implement|rollout|operational plan)\b/i.test(lower),
+                    hasFeedbackLoop: /\b(feedback loop|monitor|measure|telemetry|iteration|reassess|update model|refine)\b/i.test(lower),
+                    hasBiasCheck: /\b(bias|heuristic risk|confirmation bias|availability bias|debias|counter-bias)\b/i.test(lower)
+                };
+                const stageSignalCount = Object.values(stageChecks).filter(Boolean).length;
+                const minStageSignals = instructionProfile?.decisionMode
+                    ? MIN_HUMAN_COGNITION_STAGE_SIGNALS_DECISION
+                    : MIN_HUMAN_COGNITION_STAGE_SIGNALS;
+                const requiredStages = instructionProfile?.decisionMode
+                    ? ['hasAttentionFilter', 'hasPerceptionInterpretation', 'hasDecisionStep', 'hasActionStep', 'hasFeedbackLoop']
+                    : ['hasAttentionFilter', 'hasPerceptionInterpretation', 'hasActionStep', 'hasFeedbackLoop'];
+                const missingRequiredStages = requiredStages.filter(key => !stageChecks[key]);
+                const stageLabels = {
+                    hasAttentionFilter: 'attention filtering',
+                    hasPerceptionInterpretation: 'perception and interpretation',
+                    hasDualProcess: 'dual-process reasoning',
+                    hasDecisionStep: 'decision stage',
+                    hasActionStep: 'action stage',
+                    hasFeedbackLoop: 'feedback loop',
+                    hasBiasCheck: 'bias/heuristic check'
+                };
 
                 const reasons = [];
                 if (!hasMentalModelSection) reasons.push('Missing explicit "Mental Model" section.');
@@ -806,6 +834,18 @@ ${evidenceDigest}`
                 if (!hasCitationCoverage) reasons.push('Claim citation coverage is below required threshold.');
                 if (!hasCitationPrecision) reasons.push('Citation precision is below required threshold.');
                 if (!crossSourceSatisfied) reasons.push('Cross-source reasoning is weak (insufficient distinct cited documents).');
+                if (stageSignalCount < minStageSignals) {
+                    reasons.push(`Human cognitive cycle is incomplete (${stageSignalCount}/${minStageSignals} stage signals).`);
+                }
+                if (missingRequiredStages.length) {
+                    reasons.push(`Missing required cognitive stages: ${missingRequiredStages.map(key => stageLabels[key] || key).join(', ')}.`);
+                }
+                if (instructionProfile?.decisionMode && !stageChecks.hasDualProcess) {
+                    reasons.push('Decision analysis must include dual-process reasoning (fast hypothesis + slow analytical validation).');
+                }
+                if (!stageChecks.hasBiasCheck) {
+                    reasons.push('Missing heuristic/bias risk check and mitigation.');
+                }
 
                 const decisionChecks = {
                     hasOptionsTradeoffs: /(^|\n)\s*#{1,3}\s*(options?\s*&\s*trade-?offs?|trade-?offs?|options?)\b/i.test(text) || /trade-?off|option|alternative|pros|cons/i.test(lower),
@@ -831,6 +871,11 @@ ${evidenceDigest}`
                     minReasoningSignals,
                     crossSourceExpected,
                     crossSourceSatisfied,
+                    stageChecks,
+                    stageSignalCount,
+                    minStageSignals,
+                    missingRequiredStages,
+                    stageLabels,
                     decisionChecks,
                     activationCoverage: activationReport?.activationCoveragePct || 0
                 };
@@ -854,8 +899,17 @@ ${evidenceDigest}`
                     '',
                     'Mandatory output scaffold:',
                     '## Mental Model',
+                    '## Human Cognitive Processing Loop',
                     '## Evidence-Based Expert Analysis'
                 ];
+                lines.push('- In "Human Cognitive Processing Loop", explicitly include:');
+                lines.push('  1) Evidence Intake (sensation proxy from retrieved documents)');
+                lines.push('  2) Attention Filtering (signal vs noise)');
+                lines.push('  3) Perception & Context Interpretation');
+                lines.push('  4) Dual-process reasoning (System 1 hypothesis + System 2 analytical verification)');
+                lines.push('  5) Decision & Action path');
+                lines.push('  6) Feedback Loop (what to monitor and how model updates)');
+                lines.push('  7) Heuristic/Bias risk check and mitigation');
                 if (decisionMode) {
                     lines.push('## Options & Trade-offs');
                     lines.push('## Recommendation');
@@ -986,6 +1040,15 @@ ${evidenceDigest}`
                 } else {
                     lines.push('- No citable evidence is currently available for this question.');
                 }
+
+                lines.push('', '## Human Cognitive Processing Loop Status');
+                lines.push('- Evidence intake (sensation proxy): limited by available retrieved documents.');
+                lines.push('- Attention filtering: partial; key signals identified but completeness is below threshold.');
+                lines.push('- Perception/interpretation: provisional and cannot be finalized.');
+                lines.push('- Dual-process reasoning (System1/System2): halted due to unresolved evidence gaps.');
+                lines.push('- Decision/action: deferred until required sources are provided.');
+                lines.push('- Feedback loop: upload requested documents, then rerun to update the model and recommendation.');
+                lines.push('- Bias/heuristic guard: withholding conclusion to avoid availability/confirmation bias from incomplete evidence.');
 
                 lines.push('', '## Uncertainties & Missing Information');
                 for (const reason of (completeness?.reasons || [])) lines.push(`- ${reason}`);
@@ -1229,18 +1292,20 @@ ${evidenceDigest}`
                 ? [
                     'Mandatory cognitive scaffold for this answer:',
                     '1) Mental Model',
-                    '2) Evidence-Based Expert Analysis',
-                    '3) Options & Trade-offs (at least 2 options)',
-                    '4) Recommendation',
-                    '5) Risks',
-                    '6) Uncertainties & Missing Information',
+                    '2) Human Cognitive Processing Loop (Evidence intake -> Attention filtering -> Perception/interpretation -> System1/System2 reasoning -> Decision/action -> Feedback loop -> Bias check)',
+                    '3) Evidence-Based Expert Analysis',
+                    '4) Options & Trade-offs (at least 2 options)',
+                    '5) Recommendation',
+                    '6) Risks',
+                    '7) Uncertainties & Missing Information',
                     'Do not output a summary-only response.'
                 ].join('\n')
                 : [
                     'Mandatory cognitive scaffold for this answer:',
                     '1) Mental Model',
-                    '2) Evidence-Based Expert Analysis',
-                    '3) Uncertainties & Missing Information',
+                    '2) Human Cognitive Processing Loop (Evidence intake -> Attention filtering -> Perception/interpretation -> System1/System2 reasoning -> Action -> Feedback loop -> Bias check)',
+                    '3) Evidence-Based Expert Analysis',
+                    '4) Uncertainties & Missing Information',
                     'Do not output a summary-only response.'
                 ].join('\n');
             return `${base}\n\n${scaffold}`;
@@ -1288,8 +1353,9 @@ ${evidenceDigest}`
                 '- Prior-turn memory is allowed only for conversational continuity (co-reference, follow-up scope, user preferences).',
                 '- Do not produce summary-only output; produce expert analysis, trade-offs, decisions, and actionable recommendations.',
                 '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
+                '- Human cognition emulation loop (mandatory in answer): Evidence Intake -> Attention Filtering -> Perception/Interpretation -> Dual-process reasoning (System1 + System2) -> Decision/Action -> Feedback Loop -> Bias check.',
                 '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
-                '- Hard response scaffold for prose answers: Mental Model -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
+                '- Hard response scaffold for prose answers: Mental Model -> Human Cognitive Processing Loop -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
                 '- For broad/decision queries, conclusions must be supported by multiple sources when available; do not rely on one dominant document.',
                 '- Build an internal mental model before final answer:',
                 '  1) entities and concepts',
@@ -1415,6 +1481,7 @@ ${evidenceDigest}`
                     '2) Ensure claim-level citations across factual statements.',
                     '3) Include these sections:',
                     '   - Mental Model',
+                    '   - Human Cognitive Processing Loop (evidence intake, attention filtering, perception/interpretation, System1/System2 reasoning, decision/action, feedback loop, bias check)',
                     '   - Evidence-Based Expert Analysis',
                     '   - Uncertainties & Missing Information',
                     '4) Do not summarize only; provide reasoning, trade-offs, and recommendation when appropriate.',

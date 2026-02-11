@@ -74,9 +74,11 @@ This repository now contains:
 - Adds a synthesis-time gate (not only post-hoc eval) that rejects summary-style responses.
 - Enforces mandatory expert reasoning structure:
   - Mental Model
+  - Human Cognitive Processing Loop (evidence intake, attention filtering, perception/interpretation, dual-process reasoning, decision/action, feedback)
   - Evidence-Based Expert Analysis
   - (for decision queries) Options & Trade-offs, Recommendation, Risks
   - Uncertainties & Missing Information
+- Requires explicit heuristic/bias checks and mitigation notes to reduce shallow one-shot conclusions.
 - Runs iterative rewrite/repair passes when reasoning depth is weak, sections are missing, or cross-source decision reasoning is shallow.
 
 ---
