@@ -358,6 +358,24 @@
             };
         }
 
+        if (typeof CognitiveRetriever.prototype.superBrainResolveQueryFromSession !== 'function') {
+            CognitiveRetriever.prototype.superBrainResolveQueryFromSession = function superBrainResolveQueryFromSession(query) {
+                const rawQuery = String(query || '').trim();
+                if (!rawQuery) return rawQuery;
+                const needsResolution = /\b(it|this|that|those|these|they|them|the previous|previous one|same one|compare it|what about)\b/i.test(rawQuery);
+                if (!needsResolution) return rawQuery;
+                const history = (typeof window !== 'undefined' && window.app?.synthesizer?.conversationHistory)
+                    ? window.app.synthesizer.conversationHistory
+                    : [];
+                if (!Array.isArray(history) || !history.length) return rawQuery;
+                const recentUser = history.slice().reverse().find(item => item?.role === 'user' && String(item?.content || '').trim().length > 0);
+                if (!recentUser) return rawQuery;
+                const contextHint = String(recentUser.content || '').replace(/\s+/g, ' ').trim().slice(0, 260);
+                if (!contextHint) return rawQuery;
+                return `${rawQuery}\n\n[Session reference hint: prior user context = ${contextHint}]`;
+            };
+        }
+
         if (typeof CognitiveRetriever.prototype.buildIterativeQueries !== 'function') {
             CognitiveRetriever.prototype.buildIterativeQueries = function buildIterativeQueries(query, intent = {}) {
                 const baseVariants = typeof this.generateQueryVariants === 'function'
@@ -704,7 +722,7 @@ ${evidenceDigest}`
                 const broadScope = this.superBrainIsBroadScopeQuestion(query);
                 const decisionLike = !!instructionProfile?.decisionMode;
                 if (!broadScope && !decisionLike) return 1;
-                if (totalDocs >= 12) return 4;
+                if (totalDocs >= 12) return 3;
                 if (totalDocs >= 7) return 3;
                 if (totalDocs >= MIN_BROAD_SCOPE_DOCS) return 2;
                 return 1;
@@ -765,20 +783,29 @@ ${evidenceDigest}`
                 const totalClaims = Number.isFinite(safeDiagnostics.totalClaims) ? safeDiagnostics.totalClaims : 0;
                 const citationCount = Number.isFinite(safeDiagnostics.citationCount) ? safeDiagnostics.citationCount : 0;
                 const broadOrDecision = !!instructionProfile?.decisionMode || this.superBrainIsBroadScopeQuestion(query);
-                const minCoverage = broadOrDecision ? 0.72 : 0.62;
-                const minSupport = broadOrDecision ? 0.46 : 0.36;
-                const minPrecision = broadOrDecision ? 0.52 : 0.42;
+                const minCoverage = broadOrDecision ? 0.66 : 0.58;
+                const minSupport = broadOrDecision ? 0.40 : 0.32;
+                const minPrecision = broadOrDecision ? 0.48 : 0.40;
                 const hasSections = this.superBrainHasRequiredSections(responseText, instructionProfile, query);
 
+                const failCoverage = totalClaims >= 3 && citationCoverage < minCoverage;
+                const failSupport = totalClaims >= 3 && supportRatio < minSupport;
+                const failPrecision = citationCount > 0 && citationPrecision < minPrecision;
+                const failSections = !hasSections;
                 const reasons = [];
-                if (totalClaims >= 3 && citationCoverage < minCoverage) reasons.push(`Claim citation coverage too low (${(citationCoverage * 100).toFixed(1)}%).`);
-                if (totalClaims >= 3 && supportRatio < minSupport) reasons.push(`Claim support ratio too low (${(supportRatio * 100).toFixed(1)}%).`);
-                if (citationCount > 0 && citationPrecision < minPrecision) reasons.push(`Citation precision too low (${(citationPrecision * 100).toFixed(1)}%).`);
-                if (!hasSections) reasons.push('Required expert-structure sections are missing.');
+                if (failCoverage) reasons.push(`Claim citation coverage too low (${(citationCoverage * 100).toFixed(1)}%).`);
+                if (failSupport) reasons.push(`Claim support ratio too low (${(supportRatio * 100).toFixed(1)}%).`);
+                if (failPrecision) reasons.push(`Citation precision too low (${(citationPrecision * 100).toFixed(1)}%).`);
+                if (failSections) reasons.push('Required expert-structure sections are missing.');
 
                 return {
                     passed: reasons.length === 0,
                     reasons,
+                    failCoverage,
+                    failSupport,
+                    failPrecision,
+                    failSections,
+                    evidenceFailure: failCoverage || failSupport || failPrecision,
                     minCoverage,
                     minSupport,
                     minPrecision,
@@ -797,13 +824,46 @@ ${evidenceDigest}`
                 instructionProfile = {}
             ) {
                 let workingChunks = Array.isArray(relevantChunks) ? relevantChunks.slice() : [];
+                const shouldIterate = (
+                    this.superBrainIsBroadScopeQuestion(query) ||
+                    !!instructionProfile?.decisionMode ||
+                    (localStats.numDocs || 0) >= 8 ||
+                    workingChunks.length >= 16
+                );
                 let stableCycles = 0;
                 let prevGapCount = null;
                 let prevDocCount = new Set(workingChunks.map(item => item.filename)).size;
                 let prevChunkCount = workingChunks.length;
                 let latestModel = null;
                 let latestCompleteness = null;
-                let passes = 0;
+                let passes = 1;
+
+                if (!shouldIterate) {
+                    const quickSources = uniqBy(
+                        [
+                            ...(attachmentContext?.chunks || []).map(item => ({ ...item, filename: attachmentContext?.name || item.filename || 'attachment' })),
+                            ...workingChunks
+                        ],
+                        item => item.id || `${item.filename}:${item.index || 0}:${item.page || 'na'}`
+                    ).slice(0, MAX_MENTAL_MODEL_SOURCES * 2);
+                    latestModel = await this.superBrainBuildModel(query, workingChunks, attachmentContext, localStats);
+                    latestCompleteness = this.superBrainAssessEvidenceCompleteness(
+                        query,
+                        quickSources,
+                        localStats.activationReport || {},
+                        latestModel,
+                        null,
+                        localStats,
+                        instructionProfile
+                    );
+                    return {
+                        stabilizedChunks: workingChunks,
+                        mentalModel: latestModel,
+                        completeness: latestCompleteness,
+                        passes,
+                        stabilized: true
+                    };
+                }
 
                 for (let cycle = 0; cycle < MAX_MODEL_STABILIZATION_CYCLES; cycle++) {
                     passes = cycle + 1;
@@ -921,7 +981,7 @@ ${evidenceDigest}`
                 if (gapCount >= 5 && docCount < 4) {
                     reasons.push('Mental model still contains multiple unresolved evidence gaps.');
                 }
-                if (diagnostics && diagnostics.totalClaims >= 3 && diagnostics.claimSupportRatio < 0.3) {
+                if (diagnostics && diagnostics.totalClaims >= 3 && diagnostics.claimSupportRatio < 0.24 && sourceCount <= Math.max(4, requiredDocs * 2)) {
                     reasons.push('Claim support remains weak after synthesis/repair.');
                 }
 
@@ -1014,16 +1074,7 @@ ${evidenceDigest}`
 
         if (typeof CognitiveSynthesizer.prototype.superBrainBuildContinuitySafeHistory !== 'function') {
             CognitiveSynthesizer.prototype.superBrainBuildContinuitySafeHistory = function superBrainBuildContinuitySafeHistory(history = []) {
-                const snapshot = Array.isArray(history) ? history.slice(-12) : [];
-                return snapshot.map(message => {
-                    if (message?.role === 'assistant') {
-                        return {
-                            role: 'assistant',
-                            content: '[Prior assistant turn retained for dialogue continuity only. Re-validate all facts using retrieved sources in this turn.]'
-                        };
-                    }
-                    return message;
-                });
+                return Array.isArray(history) ? history.slice(-12) : [];
             };
         }
     }
@@ -1046,6 +1097,9 @@ ${evidenceDigest}`
 
         patchMethod(CognitiveRetriever, 'retrieve', (original) => async function patchedRetrieve(query, topK = null, options = {}) {
             if (!this.allChunks?.length) return [];
+            const retrievalQuery = typeof this.superBrainResolveQueryFromSession === 'function'
+                ? this.superBrainResolveQueryFromSession(query)
+                : query;
 
             const baseIntent = options.intent || (typeof this.detectQueryIntent === 'function'
                 ? this.detectQueryIntent(query)
@@ -1061,13 +1115,13 @@ ${evidenceDigest}`
 
             const base = await original.call(
                 this,
-                query,
+                retrievalQuery,
                 Math.max(18, Math.ceil(targetTopK * 0.8)),
                 { ...options, intent }
             );
 
             const anchors = typeof this.getDocumentAnchors === 'function'
-                ? this.getDocumentAnchors(query, intent)
+                ? this.getDocumentAnchors(retrievalQuery, intent)
                 : [];
 
             let merged = typeof this.mergeUniqueChunks === 'function'
@@ -1075,7 +1129,7 @@ ${evidenceDigest}`
                 : uniqBy([...base, ...anchors], item => item.id);
 
             const conceptLinked = typeof this.expandImplicitConceptLinks === 'function'
-                ? this.expandImplicitConceptLinks(merged, query, Math.max(10, Math.ceil(targetTopK * 0.65)))
+                ? this.expandImplicitConceptLinks(merged, retrievalQuery, Math.max(10, Math.ceil(targetTopK * 0.65)))
                 : [];
 
             merged = typeof this.mergeUniqueChunks === 'function'
@@ -1087,7 +1141,7 @@ ${evidenceDigest}`
                 : uniqBy([...merged, ...conceptLinked], item => item.id);
 
             const iterative = typeof this.applyIterativeRetrievalPasses === 'function'
-                ? await this.applyIterativeRetrievalPasses(query, merged, targetTopK, options, intent, original)
+                ? await this.applyIterativeRetrievalPasses(retrievalQuery, merged, targetTopK, options, intent, original)
                 : { merged, passCount: 1, stabilized: false };
             merged = iterative.merged;
 
@@ -1095,7 +1149,7 @@ ${evidenceDigest}`
             if (typeof this.shouldUseSemanticRerank === 'function'
                 && this.shouldUseSemanticRerank(intent, merged, targetTopK)
                 && typeof this.semanticRerank === 'function') {
-                const semantic = await this.semanticRerank(query, merged, targetTopK, intent);
+                const semantic = await this.semanticRerank(retrievalQuery, merged, targetTopK, intent);
                 if (semantic?.length) ranked = semantic;
             } else {
                 ranked = merged
@@ -1121,11 +1175,11 @@ ${evidenceDigest}`
                 /\b(overall|across|enterprise|comprehensive|policy|strategy|trade-?off|decision|recommend)\b/i.test(String(query || ''))
             );
             const requiredDocs = requiresCrossSource
-                ? ((this.documents?.length || 0) >= 12 ? 4 : (this.documents?.length || 0) >= 7 ? 3 : Math.min((this.documents?.length || 0), MIN_BROAD_SCOPE_DOCS))
+                ? ((this.documents?.length || 0) >= 7 ? 3 : Math.min((this.documents?.length || 0), MIN_BROAD_SCOPE_DOCS))
                 : 1;
             if (requiresCrossSource && (this.documents?.length || 0) >= MIN_BROAD_SCOPE_DOCS && outDocCount < requiredDocs) {
                 const extraAnchors = typeof this.getDocumentAnchors === 'function'
-                    ? this.getDocumentAnchors(`${query} cross-document evidence`, intent)
+                    ? this.getDocumentAnchors(`${retrievalQuery} cross-document evidence`, intent)
                     : [];
                 const seenDocNames = new Set(out.map(item => item.filename));
                 for (const anchor of extraAnchors) {
@@ -1188,7 +1242,7 @@ ${evidenceDigest}`
             const activationBlock = summarizeActivation(corpusStats.activationReport);
             const modelBlock = corpusStats.superBrainMentalModelBlock || '';
             const cognitionRules = [
-                'STRICT FRESH-PASS RAG POLICY (MANDATORY)',
+                'STRICT EVIDENCE-GROUNDED RAG POLICY (MANDATORY)',
                 '- Use only retrieved sources from this request.',
                 '- Do not use prior chat memory as evidence.',
                 '- Prior-turn memory is allowed only for conversational continuity (co-reference, follow-up scope, user preferences).',
@@ -1388,20 +1442,20 @@ ${evidenceDigest}`
                 )
                 : { needsMoreEvidence: false };
             if (!gate.passed) {
+                const gateIndicatesEvidenceGap = !!gate.evidenceFailure;
                 completeness = {
                     ...completeness,
-                    needsMoreEvidence: true,
-                    reasons: uniqBy(
-                        [...(completeness.reasons || []), ...(gate.reasons || [])],
-                        item => item
-                    ).slice(0, 10),
-                    requestedDocuments: uniqBy(
-                        [
-                            ...(completeness.requestedDocuments || []),
-                            'Provide additional primary source documents that directly support the currently unsupported major claims.'
-                        ],
-                        item => item
-                    ).slice(0, 10)
+                    needsMoreEvidence: completeness.needsMoreEvidence || gateIndicatesEvidenceGap,
+                    reasons: uniqBy([...(completeness.reasons || []), ...(gate.reasons || [])], item => item).slice(0, 10),
+                    requestedDocuments: gateIndicatesEvidenceGap
+                        ? uniqBy(
+                            [
+                                ...(completeness.requestedDocuments || []),
+                                'Provide additional primary source documents that directly support the currently unsupported major claims.'
+                            ],
+                            item => item
+                        ).slice(0, 10)
+                        : (completeness.requestedDocuments || [])
                 };
             }
             if (completeness.needsMoreEvidence && typeof this.superBrainBuildMissingEvidenceResponse === 'function') {
