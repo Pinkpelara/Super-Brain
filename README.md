@@ -44,6 +44,15 @@ This repository now contains:
   - Evidence-Based Answer
   - Uncertainties & Missing Information
 
+### 6) Iterative retrieval + evidence sufficiency guard
+- Runs iterative retrieval query expansions until retrieval coverage stabilizes.
+- Enforces broader cross-source coverage for broad/comparative/decision questions.
+- If evidence is still insufficient, explicitly requests missing documents/data instead of guessing.
+
+### 7) Continuity-safe session handling
+- Keeps conversational continuity for follow-up references.
+- Prevents prior assistant turns from becoming factual evidence in fresh reasoning passes.
+
 ---
 
 ## Nature paper inspiration
