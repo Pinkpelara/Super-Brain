@@ -94,6 +94,20 @@ This repository now contains:
 
 ---
 
+## Wiring guarantees (current build)
+
+The current implementation hard-wires previously fragile features:
+
+- Core `synthesize()` now always runs a strict cognitive post-processing gate unless an outer super-brain wrapper intentionally takes over that step.
+- Completion reliability features are connected in runtime:
+  - response caching (TTL + bounded size),
+  - fallback model chain on transient API failures,
+  - telemetry for cache hits and fallback usage.
+- Chat restore/render path now escapes user/system content before HTML injection points to prevent stored HTML/script injection.
+- Stop-word token sets are reused instead of recreated per call in hot paths.
+
+---
+
 ## Nature paper inspiration
 
 This patch’s cognition prior is explicitly aligned with:

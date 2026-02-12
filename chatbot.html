@@ -730,6 +730,33 @@
     const TPM_CONTEXT_TOKEN_BUDGET = 9500;
     const TPM_RETRY_CONTEXT_TOKEN_BUDGET = 7200;
     const MAP_PHASE_MAX_TOKENS = 420;
+    const RESPONSE_CACHE_KEY = 'completion_response_cache_v1';
+    const RESPONSE_CACHE_MAX_ENTRIES = 120;
+    const RESPONSE_CACHE_TTL_MS = 1000 * 60 * 30;
+    const COMPLETION_TELEMETRY_KEY = 'completion_telemetry_v1';
+    const MODEL_FALLBACK_ORDER = ['gpt-4.1', 'gpt-4o', 'gpt-4o-mini'];
+    const RETRIEVER_STOP_WORDS = new Set([
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'this', 'that',
+        'these', 'those', 'what', 'which', 'who', 'whom', 'whose', 'when', 'where',
+        'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other',
+        'some', 'such', 'than', 'too', 'very', 'just', 'also', 'into', 'about',
+        'over', 'under', 'through', 'across'
+    ]);
+    const DIAGNOSTIC_STOP_WORDS = new Set([
+        'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'in', 'on', 'at', 'to', 'for', 'of',
+        'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it', 'its', 'that',
+        'this', 'these', 'those', 'we', 'they', 'their', 'there', 'here', 'which', 'what', 'when',
+        'where', 'why', 'how', 'can', 'could', 'should', 'would', 'may', 'might', 'will', 'also'
+    ]);
+    const SUPER_BRAIN_STOP_WORDS = new Set([
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
+        'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it',
+        'this', 'that', 'these', 'those', 'can', 'could', 'should', 'would', 'may',
+        'might', 'will', 'also', 'than', 'then', 'into', 'over', 'under'
+    ]);
     const HUMAN_BASELINE_METRICS = {
         overall: 0.74,
         coverage: 0.76,
@@ -1248,6 +1275,7 @@
             this.chunkEmbeddingTextCache = new Map();
             this.embeddingEnabled = true;
             this.lastEmbeddingError = '';
+            this.stopWords = RETRIEVER_STOP_WORDS;
         }
 
         setEmbeddingApiKey(apiKey) { this.embeddingApiKey = apiKey || ''; }
@@ -1484,16 +1512,7 @@
         }
 
         isStopWord(word) {
-            const stopWords = new Set([
-                'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-                'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be',
-                'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'this', 'that',
-                'these', 'those', 'what', 'which', 'who', 'whom', 'whose', 'when', 'where',
-                'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other',
-                'some', 'such', 'than', 'too', 'very', 'just', 'also', 'into', 'about'
-            ]);
-            return stopWords.has(word);
+            return this.stopWords.has(word);
         }
 
         extractEntities(text) {
@@ -1839,6 +1858,9 @@
             this.model = localStorage.getItem('openai_model') || 'gpt-4.1';
             this.conversationHistory = this.loadChatHistory();
             this.workingMemory = this.loadWorkingMemory();
+            this.responseCache = this.loadResponseCache();
+            this.completionTelemetry = this.loadCompletionTelemetry();
+            this.__skipCoreStrictPostProcessing = false;
         }
 
         loadChatHistory() {
@@ -1849,6 +1871,74 @@
         loadWorkingMemory() {
             const saved = localStorage.getItem('working_memory');
             try { return saved ? JSON.parse(saved) : []; } catch { return []; }
+        }
+
+        loadResponseCache() {
+            const saved = localStorage.getItem(RESPONSE_CACHE_KEY);
+            if (!saved) return new Map();
+            try {
+                const parsed = JSON.parse(saved);
+                if (!Array.isArray(parsed)) return new Map();
+                const entries = parsed
+                    .filter(item => Array.isArray(item) && item.length === 2 && typeof item[0] === 'string' && item[1] && typeof item[1] === 'object')
+                    .slice(-RESPONSE_CACHE_MAX_ENTRIES);
+                return new Map(entries);
+            } catch {
+                return new Map();
+            }
+        }
+
+        saveResponseCache() {
+            const now = Date.now();
+            const entries = Array.from(this.responseCache.entries())
+                .filter(([, value]) => value && (now - Number(value.timestamp || 0)) <= RESPONSE_CACHE_TTL_MS)
+                .slice(-RESPONSE_CACHE_MAX_ENTRIES);
+            this.responseCache = new Map(entries);
+            localStorage.setItem(RESPONSE_CACHE_KEY, JSON.stringify(entries));
+        }
+
+        loadCompletionTelemetry() {
+            const saved = localStorage.getItem(COMPLETION_TELEMETRY_KEY);
+            const defaults = {
+                totalCalls: 0,
+                cacheHits: 0,
+                fallbackUses: 0,
+                lastRequestedModel: '',
+                lastServedModel: '',
+                updatedAt: null
+            };
+            if (!saved) return defaults;
+            try {
+                const parsed = JSON.parse(saved);
+                if (!parsed || typeof parsed !== 'object') return defaults;
+                return {
+                    totalCalls: Number(parsed.totalCalls || 0),
+                    cacheHits: Number(parsed.cacheHits || 0),
+                    fallbackUses: Number(parsed.fallbackUses || 0),
+                    lastRequestedModel: String(parsed.lastRequestedModel || ''),
+                    lastServedModel: String(parsed.lastServedModel || ''),
+                    updatedAt: parsed.updatedAt || null
+                };
+            } catch {
+                return defaults;
+            }
+        }
+
+        saveCompletionTelemetry() {
+            localStorage.setItem(COMPLETION_TELEMETRY_KEY, JSON.stringify(this.completionTelemetry || {}));
+        }
+
+        recordCompletionTelemetry({ cacheHit = false, fallbackUsed = false, requestedModel = '', servedModel = '' } = {}) {
+            if (!this.completionTelemetry || typeof this.completionTelemetry !== 'object') {
+                this.completionTelemetry = this.loadCompletionTelemetry();
+            }
+            this.completionTelemetry.totalCalls = Number(this.completionTelemetry.totalCalls || 0) + 1;
+            if (cacheHit) this.completionTelemetry.cacheHits = Number(this.completionTelemetry.cacheHits || 0) + 1;
+            if (fallbackUsed) this.completionTelemetry.fallbackUses = Number(this.completionTelemetry.fallbackUses || 0) + 1;
+            this.completionTelemetry.lastRequestedModel = String(requestedModel || this.model || '');
+            this.completionTelemetry.lastServedModel = String(servedModel || requestedModel || this.model || '');
+            this.completionTelemetry.updatedAt = new Date().toISOString();
+            this.saveCompletionTelemetry();
         }
 
         saveChatHistory() {
@@ -1876,6 +1966,103 @@
         setModel(model) {
             this.model = model;
             localStorage.setItem('openai_model', model);
+        }
+
+        hashString(value = '') {
+            let hash = 2166136261;
+            const text = String(value || '');
+            for (let i = 0; i < text.length; i++) {
+                hash ^= text.charCodeAt(i);
+                hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+            }
+            return (hash >>> 0).toString(16);
+        }
+
+        buildCompletionCacheKey(messages, payload = {}) {
+            const signature = JSON.stringify({
+                model: String(payload.model || this.model || ''),
+                temperature: Number(payload.temperature ?? 0.25),
+                top_p: Number(payload.top_p ?? 0.9),
+                max_tokens: Number(payload.max_tokens ?? 2500),
+                messages: (messages || []).map(msg => ({
+                    role: String(msg?.role || ''),
+                    content: String(msg?.content || '')
+                }))
+            });
+            return `cc_v1_${this.hashString(signature)}`;
+        }
+
+        shouldUseCompletionCache(payload = {}) {
+            const temperature = Number(payload.temperature ?? 0.25);
+            return temperature <= 0.35;
+        }
+
+        getCachedCompletion(cacheKey) {
+            if (!cacheKey || !this.responseCache.has(cacheKey)) return null;
+            const entry = this.responseCache.get(cacheKey);
+            if (!entry || typeof entry.response !== 'string') {
+                this.responseCache.delete(cacheKey);
+                return null;
+            }
+            const ageMs = Date.now() - Number(entry.timestamp || 0);
+            if (!Number.isFinite(ageMs) || ageMs > RESPONSE_CACHE_TTL_MS) {
+                this.responseCache.delete(cacheKey);
+                return null;
+            }
+            return entry;
+        }
+
+        setCachedCompletion(cacheKey, responseText, modelUsed) {
+            if (!cacheKey || !responseText) return;
+            this.responseCache.set(cacheKey, {
+                response: String(responseText),
+                model: String(modelUsed || this.model || ''),
+                timestamp: Date.now()
+            });
+            this.saveResponseCache();
+        }
+
+        buildModelFallbackChain(primaryModel) {
+            const preferred = String(primaryModel || this.model || '').trim();
+            const chain = [];
+            for (const model of [preferred, ...MODEL_FALLBACK_ORDER]) {
+                const name = String(model || '').trim();
+                if (!name || chain.includes(name)) continue;
+                chain.push(name);
+            }
+            return chain.length ? chain : [this.model];
+        }
+
+        isFallbackEligibleError(error) {
+            const status = Number(error?.status);
+            if (Number.isFinite(status) && ([408, 409, 429].includes(status) || status >= 500)) return true;
+            const msg = String(error?.message || '').toLowerCase();
+            return /rate limit|overloaded|temporar|timeout|timed out|network|failed to fetch|tokens per min|tpm|connection|econn|unavailable|gateway/.test(msg);
+        }
+
+        async requestCompletion(payload) {
+            const response = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.apiKey}`
+                },
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) {
+                let detail = 'API request failed';
+                try {
+                    const error = await response.json();
+                    detail = error.error?.message || detail;
+                } catch {
+                    detail = `${detail} (HTTP ${response.status})`;
+                }
+                const err = new Error(detail);
+                err.status = response.status;
+                throw err;
+            }
+            const data = await response.json();
+            return data.choices?.[0]?.message?.content || '';
         }
 
         buildInstructionProfile(query) {
@@ -2237,14 +2424,8 @@ Rules:
         }
 
         tokenizeForDiagnostics(text) {
-            const stop = new Set([
-                'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'in', 'on', 'at', 'to', 'for', 'of',
-                'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it', 'its', 'that',
-                'this', 'these', 'those', 'we', 'they', 'their', 'there', 'here', 'which', 'what', 'when',
-                'where', 'why', 'how', 'can', 'could', 'should', 'would', 'may', 'might', 'will', 'also'
-            ]);
             return String(text || '').toLowerCase().replace(/[^\w\s-]/g, ' ')
-                .split(/\s+/).filter(token => token.length > 2 && !stop.has(token));
+                .split(/\s+/).filter(token => token.length > 2 && !DIAGNOSTIC_STOP_WORDS.has(token));
         }
 
         normalizeFilename(name) {
@@ -2444,6 +2625,113 @@ ${answer}`
             return repaired?.trim() ? repaired : answer;
         }
 
+        evaluateCoreCognitiveStructure(text, instructionProfile = {}) {
+            const value = String(text || '');
+            const lower = value.toLowerCase();
+            const reasons = [];
+            const hasMentalModel = /(^|\n)\s*#{1,3}\s*mental model\b/i.test(value);
+            const hasEvidenceSection = /(^|\n)\s*#{1,3}\s*(evidence-based answer|evidence-based analysis|evidence-based expert analysis|evidence synthesis)\b/i.test(value) ||
+                /\bevidence[- ]based\b/.test(lower);
+            const hasUncertaintySection = /(^|\n)\s*#{1,3}\s*uncertainties?\s*&\s*missing information\b/i.test(value) ||
+                /uncertaint|missing information|evidence gap|cannot fully confirm/i.test(lower);
+            if (!hasMentalModel) reasons.push('Missing "Mental Model" section.');
+            if (!hasEvidenceSection) reasons.push('Missing explicit evidence-based analysis section.');
+            if (!hasUncertaintySection) reasons.push('Missing "Uncertainties & Missing Information" section.');
+            if (instructionProfile?.decisionMode) {
+                const hasOptions = /(^|\n)\s*#{1,3}\s*(options?\s*&\s*trade-?offs?|trade-?offs?|options?)\b/i.test(value);
+                const hasRecommendation = /(^|\n)\s*#{1,3}\s*recommendation\b/i.test(value) || /\brecommend(?:ed|ation)?\b/i.test(lower);
+                const hasRiskSection = /(^|\n)\s*#{1,3}\s*risks?\b/i.test(value) || /\brisk(s)?\b/i.test(lower);
+                if (!hasOptions) reasons.push('Decision analysis is missing "Options & Trade-offs".');
+                if (!hasRecommendation) reasons.push('Decision analysis is missing "Recommendation".');
+                if (!hasRiskSection) reasons.push('Decision analysis is missing explicit risk section.');
+            }
+            return { passed: reasons.length === 0, reasons };
+        }
+
+        async runCoreStrictPostProcessing(
+            query,
+            responseText,
+            instructionProfile = {},
+            sources = [],
+            contextSnippet = ''
+        ) {
+            let response = String(responseText || '').trim();
+            if (!response) {
+                return {
+                    response,
+                    citationCount: 0,
+                    claimDiagnostics: this.buildClaimCitationDiagnostics('', sources),
+                    meta: { attempted: false, passed: false, reasons: ['Response was empty.'] }
+                };
+            }
+
+            if (typeof this.superBrainNormalizeCitationSyntax === 'function') {
+                response = this.superBrainNormalizeCitationSyntax(response);
+            }
+            let citationCount = this.countCitations(response);
+            let claimDiagnostics = this.buildClaimCitationDiagnostics(response, sources);
+            let structureGate = this.evaluateCoreCognitiveStructure(response, instructionProfile);
+            const sourceCount = Array.isArray(sources) ? sources.length : 0;
+            const minCitationTarget = sourceCount >= 10 ? 4 : sourceCount >= 4 ? 2 : sourceCount > 0 ? 1 : 0;
+            const needsRepair = (
+                !structureGate.passed ||
+                citationCount < minCitationTarget ||
+                claimDiagnostics.needsRepair
+            );
+            if (!needsRepair) {
+                return {
+                    response,
+                    citationCount,
+                    claimDiagnostics,
+                    meta: { attempted: false, passed: true, reasons: [] }
+                };
+            }
+
+            const reasons = [...structureGate.reasons];
+            if (citationCount < minCitationTarget) reasons.push(`Citation coverage is below target (${citationCount}/${minCitationTarget}).`);
+            if (claimDiagnostics.needsRepair) reasons.push('Claim-level citation diagnostics indicate weak grounding.');
+            const rewriteInstruction = [
+                'STRICT COGNITIVE POST-PROCESSING GATE (MANDATORY REWRITE)',
+                'Rewrite the answer into this required structure:',
+                '1) Mental Model',
+                '2) Evidence-Based Answer',
+                '3) Uncertainties & Missing Information',
+                'Rules:',
+                '- Every factual claim must include citation format [Source: filename, page X, "brief relevant quote"].',
+                '- Do not summarize only; show reasoning and evidence integration.',
+                '- Do not treat prior conversation memory as evidence.',
+                `- Minimum citation target: ${minCitationTarget}.`,
+                `- Repair reasons: ${reasons.join(' | ') || 'N/A'}`
+            ].join('\n');
+
+            const repaired = await this.verifyAndRepairAnswer(
+                query,
+                `${response}\n\n${rewriteInstruction}`,
+                instructionProfile,
+                contextSnippet,
+                claimDiagnostics
+            );
+            if (repaired?.trim()) {
+                response = repaired.trim();
+                if (typeof this.superBrainNormalizeCitationSyntax === 'function') {
+                    response = this.superBrainNormalizeCitationSyntax(response);
+                }
+            }
+            citationCount = this.countCitations(response);
+            claimDiagnostics = this.buildClaimCitationDiagnostics(response, sources);
+            structureGate = this.evaluateCoreCognitiveStructure(response, instructionProfile);
+            return {
+                response,
+                citationCount,
+                claimDiagnostics,
+                meta: {
+                    attempted: true,
+                    passed: structureGate.passed && citationCount >= minCitationTarget && !claimDiagnostics.needsRepair,
+                    reasons: structureGate.reasons
+                }
+            };
+        }
+
         getSystemPrompt(context, corpusStats = {}, instructionProfile = {}, workingMemorySummary = '') {
             const numDocs = corpusStats.numDocs || 0;
             const numChunks = corpusStats.numChunks || 0;
@@ -2558,34 +2846,58 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
         }
 
         async callCompletion(messages, overrides = {}) {
+            const opts = { ...(overrides || {}) };
+            const bypassCache = !!opts.bypass_cache || !!opts.bypassCache;
+            const allowFallback = opts.allow_fallback !== false && opts.allowFallback !== false;
+            delete opts.bypass_cache;
+            delete opts.bypassCache;
+            delete opts.allow_fallback;
+            delete opts.allowFallback;
+
             const payload = {
                 model: this.model,
                 messages,
                 temperature: 0.25,
                 max_tokens: 2500,
                 top_p: 0.9,
-                ...overrides
+                ...opts
             };
-            const response = await fetch('https://api.openai.com/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.apiKey}`
-                },
-                body: JSON.stringify(payload)
-            });
-            if (!response.ok) {
-                let detail = 'API request failed';
-                try {
-                    const error = await response.json();
-                    detail = error.error?.message || detail;
-                } catch {
-                    detail = `${detail} (HTTP ${response.status})`;
+            const requestedModel = String(payload.model || this.model || '');
+            const useCache = !bypassCache && this.shouldUseCompletionCache(payload);
+            const cacheKey = useCache ? this.buildCompletionCacheKey(messages, payload) : null;
+            if (cacheKey) {
+                const cached = this.getCachedCompletion(cacheKey);
+                if (cached) {
+                    this.recordCompletionTelemetry({
+                        cacheHit: true,
+                        requestedModel,
+                        servedModel: cached.model || requestedModel
+                    });
+                    return cached.response;
                 }
-                throw new Error(detail);
             }
-            const data = await response.json();
-            return data.choices?.[0]?.message?.content || '';
+
+            const chain = allowFallback ? this.buildModelFallbackChain(requestedModel) : [requestedModel];
+            let lastError = null;
+            for (let idx = 0; idx < chain.length; idx++) {
+                const modelCandidate = chain[idx];
+                try {
+                    const responseText = await this.requestCompletion({ ...payload, model: modelCandidate });
+                    if (cacheKey) this.setCachedCompletion(cacheKey, responseText, modelCandidate);
+                    this.recordCompletionTelemetry({
+                        cacheHit: false,
+                        fallbackUsed: idx > 0,
+                        requestedModel,
+                        servedModel: modelCandidate
+                    });
+                    return responseText;
+                } catch (error) {
+                    lastError = error;
+                    const canFallback = idx < chain.length - 1 && this.isFallbackEligibleError(error);
+                    if (!canFallback) throw error;
+                }
+            }
+            throw lastError || new Error('Completion failed with all fallback models.');
         }
 
         async synthesize(query, relevantChunks, attachmentContext = null, corpusStats = {}) {
@@ -2728,6 +3040,26 @@ ${attachmentEvidence.contextText}`);
                 claimDiagnostics = this.buildClaimCitationDiagnostics(assistantMessage, sources);
             }
 
+            let coreStrictPostProcessing = { attempted: false, passed: true, reasons: [] };
+            if (!this.__skipCoreStrictPostProcessing) {
+                const strictSnippet = [
+                    this.formatPlanForContext(cognitivePlan),
+                    mapNotes.length ? this.formatMapNotes(mapNotes.slice(0, 2)) : '',
+                    `## EVIDENCE SNIPPET\n${formattedContext.contextText.slice(0, 9000)}`
+                ].filter(Boolean).join('\n\n');
+                const strictResult = await this.runCoreStrictPostProcessing(
+                    query,
+                    assistantMessage,
+                    instructionProfile,
+                    sources,
+                    strictSnippet
+                );
+                assistantMessage = strictResult.response;
+                citationCount = strictResult.citationCount;
+                claimDiagnostics = strictResult.claimDiagnostics;
+                coreStrictPostProcessing = strictResult.meta || coreStrictPostProcessing;
+            }
+
             this.conversationHistory.push({ role: 'user', content: query }, { role: 'assistant', content: assistantMessage });
             this.saveChatHistory();
             this.rememberTurn(query, assistantMessage);
@@ -2735,7 +3067,7 @@ ${attachmentEvidence.contextText}`);
             return {
                 response: assistantMessage,
                 sources,
-                meta: { instructionProfile, cognitivePlan, mapPassCount: mapNotes.length, citationCount, claimDiagnostics }
+                meta: { instructionProfile, cognitivePlan, mapPassCount: mapNotes.length, citationCount, claimDiagnostics, coreStrictPostProcessing }
             };
         }
     }
@@ -3417,9 +3749,9 @@ ${attachmentEvidence.contextText}`);
                 return;
             }
 
-            let displayMessage = this.escapeHtml(query);
+            let displayMessage = query;
             if (hasAttachment) {
-                displayMessage = `<div class="attachment-indicator"><span>📎 ${this.escapeHtml(this.currentAttachment.name)}</span></div>${displayMessage}`;
+                displayMessage = `📎 ${this.currentAttachment.name}\n${query}`;
             }
 
             this.addMessage(displayMessage, 'user');
@@ -3471,7 +3803,7 @@ ${attachmentEvidence.contextText}`);
                     );
                 }
             } catch (error) {
-                this.addMessage(`I encountered an error: ${this.escapeHtml(error.message)}. Check API key/model and retry.`, 'system');
+                this.addMessage(`I encountered an error: ${error.message}. Check API key/model and retry.`, 'system');
             } finally {
                 this.sendBtn.disabled = false;
                 this.synthesisIndicator.classList.remove('active');
@@ -3541,7 +3873,7 @@ ${attachmentEvidence.contextText}`);
                 this.addMessage(lines.join(' '), 'system');
                 this.showToast('Benchmark harness completed successfully.', 'info');
             } catch (error) {
-                this.addMessage(`Benchmark harness error: ${this.escapeHtml(error.message || String(error))}`, 'system');
+                this.addMessage(`Benchmark harness error: ${error.message || String(error)}`, 'system');
                 this.showToast(`Benchmark harness failed: ${error.message || error}`, 'error');
             } finally {
                 this.synthesisIndicator.classList.remove('active');
@@ -3619,9 +3951,9 @@ ${attachmentEvidence.contextText}`);
         addMessage(content, role, sources = []) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${role}`;
-            let processedContent = content;
+            let processedContent = this.renderMarkdownLite(this.escapeHtml(content));
             if (role === 'assistant') processedContent = this.formatCitations(content, sources);
-            else if (role === 'system') processedContent = `<p>${this.escapeHtml(content)}</p>`;
+            else if (role === 'system') processedContent = this.renderMarkdownLite(this.escapeHtml(content));
             messageDiv.innerHTML = processedContent;
             this.chatMessages.appendChild(messageDiv);
             this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
@@ -4375,12 +4707,7 @@ ${attachmentEvidence.contextText}`);
 
             if (typeof CognitiveSynthesizer.prototype.superBrainTokenize !== 'function') {
                 CognitiveSynthesizer.prototype.superBrainTokenize = function superBrainTokenize(text) {
-                    const stop = new Set([
-                        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-                        'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it', 'this', 'that', 'these', 'those',
-                        'can', 'could', 'should', 'would', 'may', 'might', 'will', 'also'
-                    ]);
-                    return normalizeTextLite(text).split(/\s+/).filter(t => t.length > 2 && !stop.has(t));
+                    return normalizeTextLite(text).split(/\s+/).filter(t => t.length > 2 && !SUPER_BRAIN_STOP_WORDS.has(t));
                 };
             }
 
@@ -5804,7 +6131,14 @@ ${attachmentEvidence.contextText}`);
 
                 // Keep conversational memory for human continuity while enforcing
                 // strict source-only evidence for factual content.
-                const result = await original.call(this, query, refinedChunks, attachmentContext, localStats);
+                let result;
+                const prevSkipFlag = !!this.__skipCoreStrictPostProcessing;
+                this.__skipCoreStrictPostProcessing = true;
+                try {
+                    result = await original.call(this, query, refinedChunks, attachmentContext, localStats);
+                } finally {
+                    this.__skipCoreStrictPostProcessing = prevSkipFlag;
+                }
 
                 if (!result || typeof result.response !== 'string') return result;
 

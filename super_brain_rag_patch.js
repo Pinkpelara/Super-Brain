@@ -41,6 +41,12 @@
     const MAX_ADVERSARIAL_CHUNKS = 16;
     const MAX_PREDICTIVE_HYPOTHESES = 5;
     const MIN_CROSS_SOURCE_DOCS = 2;
+    const SUPER_BRAIN_STOP_WORDS = new Set([
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
+        'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it',
+        'this', 'that', 'these', 'those', 'can', 'could', 'should', 'would', 'may',
+        'might', 'will', 'also', 'than', 'then', 'into', 'over', 'under'
+    ]);
 
     const COGNITION_PRIOR = [
         'Abstract latent task structure from surface wording.',
@@ -734,16 +740,10 @@
 
         if (typeof CognitiveSynthesizer.prototype.superBrainTokenize !== 'function') {
             CognitiveSynthesizer.prototype.superBrainTokenize = function superBrainTokenize(text) {
-                const stop = new Set([
-                    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
-                    'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it',
-                    'this', 'that', 'these', 'those', 'can', 'could', 'should', 'would', 'may',
-                    'might', 'will', 'also', 'than', 'then', 'into', 'over', 'under'
-                ]);
                 return safeLower(text)
                     .replace(/[^\w\s-]/g, ' ')
                     .split(/\s+/)
-                    .filter(token => token.length > 2 && !stop.has(token));
+                    .filter(token => token.length > 2 && !SUPER_BRAIN_STOP_WORDS.has(token));
             };
         }
 
@@ -2068,11 +2068,14 @@ ${evidenceDigest}`
             const continuityHistory = historySnapshot.slice(-12);
             let result;
             let latestTurn = [];
+            const prevSkipFlag = !!this.__skipCoreStrictPostProcessing;
             try {
+                this.__skipCoreStrictPostProcessing = true;
                 this.conversationHistory = continuityHistory;
                 result = await original.call(this, query, refinedChunks, attachmentContext, localStats);
                 latestTurn = Array.isArray(this.conversationHistory) ? this.conversationHistory.slice(-2) : [];
             } finally {
+                this.__skipCoreStrictPostProcessing = prevSkipFlag;
                 this.conversationHistory = [...historySnapshot, ...latestTurn].slice(-40);
                 if (typeof this.saveChatHistory === 'function') this.saveChatHistory();
             }
