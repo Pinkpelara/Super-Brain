@@ -3679,7 +3679,7 @@ ${attachmentEvidence.contextText}`);
     (function inlineSuperBrainEnhancer() {
         'use strict';
 
-        const PATCH_VERSION = '2026-02-11-inline-superbrain-v6';
+        const PATCH_VERSION = '2026-02-11-inline-superbrain-v7';
         const FULL_SCAN_MIN_TOPK = 26;
         const FULL_SCAN_MAX_TOPK = 46;
         const MAX_CONCEPT_EXPANSION = 30;
@@ -3697,6 +3697,7 @@ ${attachmentEvidence.contextText}`);
         const MIN_HUMAN_COGNITION_STAGE_SIGNALS_DECISION = 5;
         const MAX_ADVERSARIAL_RETRIEVAL_PASSES = 3;
         const MAX_ADVERSARIAL_CHUNKS = 16;
+        const MAX_PREDICTIVE_HYPOTHESES = 5;
         const MIN_CROSS_SOURCE_DOCS = 2;
         const FULL_CORPUS_DOC_ANCHORS_PER_DOC = 6;
         const FULL_CORPUS_DOC_TOP_RELEVANT = 3;
@@ -4063,9 +4064,59 @@ ${attachmentEvidence.contextText}`);
                 };
             }
 
-            if (typeof CognitiveRetriever.prototype.superBrainBuildProbeQueries !== 'function') {
-                CognitiveRetriever.prototype.superBrainBuildProbeQueries = function superBrainBuildProbeQueries(query, intentGraph = null, intent = {}) {
+            if (typeof CognitiveRetriever.prototype.superBrainBuildPredictiveModel !== 'function') {
+                CognitiveRetriever.prototype.superBrainBuildPredictiveModel = function superBrainBuildPredictiveModel(query, intentGraph = null, intent = {}) {
                     const graph = intentGraph || this.superBrainBuildIntentGraph(query);
+                    const raw = String(query || '').replace(/\s+/g, ' ').trim();
+                    const hypotheses = [];
+                    const pushHypothesis = (type, statement, confidence = 0.5) => {
+                        const cleaned = String(statement || '').replace(/\s+/g, ' ').trim();
+                        if (!cleaned) return;
+                        hypotheses.push({ type, statement: cleaned, confidence });
+                    };
+
+                    pushHypothesis('baseline_rule', `Primary rule likely governs: ${raw}`, 0.58);
+                    if (graph.constraints?.length) {
+                        pushHypothesis('constraint', `Constraints likely narrow options: ${graph.constraints.slice(0, 2).join('; ')}`, 0.63);
+                    }
+                    if (graph.relations?.length || intent.comparative) {
+                        pushHypothesis('tradeoff', 'Competing factors likely require weighing trade-offs rather than applying a single rule.', 0.66);
+                    }
+                    if (/\b(late|deadline|exception|override|appeal|special case)\b/i.test(raw)) {
+                        pushHypothesis('exception', 'General policy likely has context-specific exception clauses that may supersede default restrictions.', 0.72);
+                    }
+                    if (/\b(policy|manual|guideline|rule|regulation|procedure)\b/i.test(raw)) {
+                        pushHypothesis('hierarchy', 'When sources conflict, more specific/authoritative policy text should outweigh generic guidance.', 0.76);
+                    }
+
+                    const weightingPriors = {
+                        authority: 'Prefer official, policy-grade, and source-of-record documents over summaries.',
+                        recency: 'Prefer newer versions where temporal conflict exists.',
+                        contextualRelevance: 'Prefer clauses that match the exact scenario and constraints from the query.'
+                    };
+                    const anticipatedConclusion = hypotheses.length
+                        ? hypotheses.slice(0, 2).map(item => item.statement).join(' ')
+                        : `Likely requires balancing baseline rules against scenario-specific exceptions for: ${raw}`;
+
+                    return {
+                        query: raw,
+                        anticipatedConclusion,
+                        hypotheses: uniqueBy(hypotheses, item => `${item.type}:${item.statement}`).slice(0, MAX_PREDICTIVE_HYPOTHESES),
+                        expectedEvidenceNeeds: [
+                            'baseline rule text',
+                            'exception/override clauses',
+                            'conflict resolution precedence statements',
+                            'implementation/action constraints'
+                        ],
+                        weightingPriors
+                    };
+                };
+            }
+
+            if (typeof CognitiveRetriever.prototype.superBrainBuildProbeQueries !== 'function') {
+                CognitiveRetriever.prototype.superBrainBuildProbeQueries = function superBrainBuildProbeQueries(query, intentGraph = null, intent = {}, predictiveModel = null) {
+                    const graph = intentGraph || this.superBrainBuildIntentGraph(query);
+                    const predictive = predictiveModel || this.superBrainBuildPredictiveModel(query, graph, intent);
                     const probes = [];
                     const push = (value) => {
                         const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
@@ -4079,6 +4130,12 @@ ${attachmentEvidence.contextText}`);
                     if (graph.relations.length || intent.comparative) push(`${query} compare trade-offs and dependencies`);
                     if (intent.timeline) push(`${query} chronology sequence and milestones`);
                     if (graph.unknowns.length) push(`${query} missing evidence validation`);
+                    if (predictive?.hypotheses?.length) {
+                        for (const hypothesis of predictive.hypotheses.slice(0, 3)) {
+                            push(`${query} validate hypothesis: ${hypothesis.statement}`);
+                        }
+                    }
+                    push(`${query} specific clause that overrides general rule`);
                     return uniqueBy(probes, item => normalizeTextLite(item)).slice(0, MAX_RETRIEVAL_REFINEMENT_PASSES * 2);
                 };
             }
@@ -4123,11 +4180,18 @@ ${attachmentEvidence.contextText}`);
             if (typeof CognitiveRetriever.prototype.superBrainRunRetrievalRefinement !== 'function') {
                 CognitiveRetriever.prototype.superBrainRunRetrievalRefinement = async function superBrainRunRetrievalRefinement(query, seedChunks = [], topK = FULL_SCAN_MIN_TOPK, options = {}, intent = {}, originalRetrieve = null) {
                     if (typeof originalRetrieve !== 'function') {
-                        return { chunks: seedChunks || [], passes: 1, stabilized: true, intentGraph: this.superBrainBuildIntentGraph(query) };
+                        return {
+                            chunks: seedChunks || [],
+                            passes: 1,
+                            stabilized: true,
+                            intentGraph: this.superBrainBuildIntentGraph(query),
+                            predictiveModel: this.superBrainBuildPredictiveModel(query, this.superBrainBuildIntentGraph(query), intent)
+                        };
                     }
 
                     const intentGraph = this.superBrainBuildIntentGraph(query);
-                    const probes = this.superBrainBuildProbeQueries(query, intentGraph, intent);
+                    const predictiveModel = this.superBrainBuildPredictiveModel(query, intentGraph, intent);
+                    const probes = this.superBrainBuildProbeQueries(query, intentGraph, intent, predictiveModel);
                     let merged = Array.isArray(seedChunks) ? seedChunks.slice() : [];
                     let passes = 1;
                     let stableHits = 0;
@@ -4172,7 +4236,8 @@ ${attachmentEvidence.contextText}`);
                         chunks: merged,
                         passes,
                         stabilized: stableHits >= 1,
-                        intentGraph
+                        intentGraph,
+                        predictiveModel
                     };
                 };
             }
@@ -4205,8 +4270,9 @@ ${attachmentEvidence.contextText}`);
             }
 
             if (typeof CognitiveRetriever.prototype.superBrainBuildAdversarialQueries !== 'function') {
-                CognitiveRetriever.prototype.superBrainBuildAdversarialQueries = function superBrainBuildAdversarialQueries(query, seedChunks = [], intentGraph = null) {
+                CognitiveRetriever.prototype.superBrainBuildAdversarialQueries = function superBrainBuildAdversarialQueries(query, seedChunks = [], intentGraph = null, predictiveModel = null) {
                     const graph = intentGraph || this.superBrainBuildIntentGraph(query);
+                    const predictive = predictiveModel || this.superBrainBuildPredictiveModel(query, graph, {});
                     const probes = [];
                     const push = (value) => {
                         const cleaned = String(value || '').replace(/\s+/g, ' ').trim();
@@ -4229,6 +4295,9 @@ ${attachmentEvidence.contextText}`);
                     if (seedConcepts.length) {
                         push(`${query} ${seedConcepts.join(' ')} contradictions exceptions`);
                     }
+                    if (predictive?.anticipatedConclusion) {
+                        push(`${query} evidence that challenges this expectation: ${predictive.anticipatedConclusion}`);
+                    }
                     return uniqueBy(probes, item => normalizeTextLite(item)).slice(0, MAX_ADVERSARIAL_RETRIEVAL_PASSES + 2);
                 };
             }
@@ -4245,7 +4314,8 @@ ${attachmentEvidence.contextText}`);
                         return { chunks: [], passes: 0, probes: [] };
                     }
                     const intentGraph = this.superBrainBuildIntentGraph(query);
-                    const probes = this.superBrainBuildAdversarialQueries(query, seedChunks, intentGraph);
+                    const predictiveModel = options?.predictiveModel || this.superBrainBuildPredictiveModel(query, intentGraph, intent);
+                    const probes = this.superBrainBuildAdversarialQueries(query, seedChunks, intentGraph, predictiveModel);
                     let passes = 0;
                     let aggregated = [];
 
@@ -4596,6 +4666,123 @@ ${attachmentEvidence.contextText}`);
                 };
             }
 
+            if (typeof CognitiveSynthesizer.prototype.superBrainEvidenceHierarchyWeight !== 'function') {
+                CognitiveSynthesizer.prototype.superBrainEvidenceHierarchyWeight = function superBrainEvidenceHierarchyWeight(source, queryTokens = []) {
+                    const filename = String(source?.filename || '').toLowerCase();
+                    const text = String(source?.text || '');
+                    const textLower = text.toLowerCase();
+                    let authority = 0.45;
+                    if (/\b(policy|manual|regulation|official|handbook|governance|guideline|o?fr)\b/.test(filename)) authority = 0.9;
+                    else if (/\b(procedure|protocol|standard|framework)\b/.test(filename)) authority = 0.78;
+                    else if (/\b(faq|summary|notes|announcement|memo|blog)\b/.test(filename)) authority = 0.56;
+
+                    const yearMatches = filename.match(/\b(19|20)\d{2}\b/g) || text.match(/\b(19|20)\d{2}\b/g) || [];
+                    const years = yearMatches.map(y => parseInt(y, 10)).filter(Number.isFinite);
+                    const latestYear = years.length ? Math.max(...years) : null;
+                    const nowYear = new Date().getFullYear();
+                    let recency = 0.58;
+                    if (latestYear) {
+                        const delta = Math.max(0, nowYear - latestYear);
+                        recency = Math.max(0.35, 1 - (delta / 14));
+                    }
+
+                    let relevance = 0.4;
+                    if (queryTokens.length) {
+                        const overlap = queryTokens.filter(token => textLower.includes(token)).length;
+                        relevance = Math.min(1, (overlap / Math.max(1, queryTokens.length)) + 0.18);
+                    }
+                    const weighted = (authority * 0.42) + (recency * 0.24) + (relevance * 0.34);
+                    return { authority, recency, relevance, weighted, latestYear };
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.superBrainBuildPredictiveResolutionBlock !== 'function') {
+                CognitiveSynthesizer.prototype.superBrainBuildPredictiveResolutionBlock = function superBrainBuildPredictiveResolutionBlock(
+                    query,
+                    predictiveModel = null,
+                    sources = []
+                ) {
+                    if (!predictiveModel) return '';
+                    const queryTokens = this.superBrainTokenize(query);
+                    const hypotheses = Array.isArray(predictiveModel.hypotheses) ? predictiveModel.hypotheses : [];
+                    const selectedSources = (sources || []).slice(0, 26);
+                    const support = [];
+                    const contradiction = [];
+                    for (const source of selectedSources) {
+                        const sentence = this.superBrainBestSentence(source?.text || '', queryTokens).replace(/\s+/g, ' ').trim();
+                        if (!sentence) continue;
+                        const lower = sentence.toLowerCase();
+                        const contradictionSignal = /\b(however|but|except|unless|despite|contradict|override|supersede|limit)\b/.test(lower);
+                        const quote = sentence.slice(0, 110).replace(/"/g, '\'');
+                        const line = `${sentence.slice(0, 220)} [Source: ${source.filename || 'Unknown'}, page ${source.page || 'N/A'}, "${quote || 'relevant quote'}"]`;
+                        if (contradictionSignal) contradiction.push(line);
+                        else support.push(line);
+                    }
+
+                    const lines = [
+                        '## Predictive Model (Pre-Evidence Expectation)',
+                        `- Anticipated conclusion: ${predictiveModel.anticipatedConclusion || 'N/A'}`,
+                        '- Hypotheses:'
+                    ];
+                    if (hypotheses.length) {
+                        for (const item of hypotheses.slice(0, MAX_PREDICTIVE_HYPOTHESES)) {
+                            lines.push(`- (${item.type}) ${item.statement}`);
+                        }
+                    } else {
+                        lines.push('- No explicit predictive hypotheses were generated.');
+                    }
+                    lines.push('', '## Prediction Errors, Tension Detection & Resolution');
+                    if (support.length) {
+                        lines.push('- Evidence that supports the predictive model:');
+                        lines.push(...support.slice(0, 3).map(item => `- ${item}`));
+                    }
+                    if (contradiction.length) {
+                        lines.push('- Prediction errors / disconfirming evidence:');
+                        lines.push(...contradiction.slice(0, 3).map(item => `- ${item}`));
+                    } else {
+                        lines.push('- No major prediction errors detected in current evidence sample.');
+                    }
+                    lines.push('- Tension resolution rule: when baseline and exception conflict, apply contextual hierarchy (specific authoritative clause + scenario match + recency) to determine which evidence wins.');
+                    return lines.join('\n');
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.superBrainBuildContextualHierarchyBlock !== 'function') {
+                CognitiveSynthesizer.prototype.superBrainBuildContextualHierarchyBlock = function superBrainBuildContextualHierarchyBlock(query, sources = []) {
+                    const selected = uniqueBy(
+                        (sources || []).filter(item => item?.text),
+                        item => item?.id || `${item?.filename || 'unknown'}:${item?.index || 0}:${item?.page || 'na'}`
+                    ).slice(0, 24);
+                    if (!selected.length) return '';
+                    const queryTokens = this.superBrainTokenize(query);
+                    const ranked = selected.map(source => {
+                        const weight = this.superBrainEvidenceHierarchyWeight(source, queryTokens);
+                        return { source, ...weight };
+                    }).sort((a, b) => b.weighted - a.weighted);
+                    const winner = ranked[0];
+                    const challenger = ranked[1];
+
+                    const lines = ['## Contextual Hierarchy (Evidence Weighting)'];
+                    lines.push('- Weighting dimensions: Authority (42%), Recency (24%), Contextual Relevance (34%).');
+                    lines.push('- Top weighted evidence:');
+                    for (const item of ranked.slice(0, 4)) {
+                        lines.push(`- ${item.source.filename || 'Unknown'} -> score ${item.weighted.toFixed(2)} (authority ${item.authority.toFixed(2)}, recency ${item.recency.toFixed(2)}, relevance ${item.relevance.toFixed(2)})`);
+                    }
+                    if (winner) {
+                        const sentence = this.superBrainBestSentence(winner.source.text || '', queryTokens).replace(/\s+/g, ' ').trim();
+                        const quote = sentence.slice(0, 110).replace(/"/g, '\'');
+                        lines.push(`- Winning context source: ${winner.source.filename || 'Unknown'} [Source: ${winner.source.filename || 'Unknown'}, page ${winner.source.page || 'N/A'}, "${quote || 'relevant quote'}"]`);
+                    }
+                    if (winner && challenger) {
+                        const why = winner.weighted >= challenger.weighted
+                            ? `Evidence from ${winner.source.filename || 'top source'} wins over ${challenger.source.filename || 'secondary source'} due to higher weighted hierarchy score and better scenario fit.`
+                            : `Evidence tension remains unresolved; additional authoritative material is required.`;
+                        lines.push(`- Conflict resolution: ${why}`);
+                    }
+                    return lines.join('\n');
+                };
+            }
+
             if (typeof CognitiveSynthesizer.prototype.superBrainTokenOverlap !== 'function') {
                 CognitiveSynthesizer.prototype.superBrainTokenOverlap = function superBrainTokenOverlap(tokensA = [], tokensB = []) {
                     if (!tokensA.length || !tokensB.length) return [];
@@ -4750,12 +4937,23 @@ ${attachmentEvidence.contextText}`);
                 ) {
                     const text = String(responseText || '');
                     const lower = text.toLowerCase();
+                    const nonEmptyLines = text.split('\n').map(line => line.trim()).filter(Boolean);
+                    const firstLine = nonEmptyLines[0] || '';
+                    const firstParagraph = text.trim().slice(0, 260);
                     const broadOrDecision = !!instructionProfile?.decisionMode || /\b(overall|across|entire|comprehensive|compare|contrast|decision|recommend|trade-?off)\b/i.test(String(query || ''));
                     const sourceDocCount = new Set((sources || []).map(item => item?.filename).filter(Boolean)).size;
                     const citedDocs = this.superBrainExtractDistinctCitedDocs(text);
                     const reasoningSignals = (lower.match(/\b(because|therefore|however|whereas|if|then|trade-?off|constraint|depends on|due to|implies|consequently|in turn)\b/g) || []).length;
                     const optionBulletSignals = (text.match(/^\s*(?:[-*]|\d+\.)\s+(?:option|approach|alternative|path|strategy)\b/gi) || []).length;
                     const optionLabelSignals = (text.match(/\boption\s*(?:1|2|3|a|b|c)\b/gi) || []).length;
+                    const hasExecutiveSummarySection = /(^|\n)\s*#{1,3}\s*executive summary\b/i.test(text);
+                    const hasDecisionFirst = /\bdecision\s*:/i.test(firstLine) || /^\s*##\s*executive summary\b/i.test(firstLine) || /\bdecision\s*:/i.test(firstParagraph);
+                    const hasReasoningPathSection = /(^|\n)\s*#{1,3}\s*reasoning path\b/i.test(text) || /\breasoning path\s*:/i.test(lower);
+                    const hasActionableStepsSection = /(^|\n)\s*#{1,3}\s*actionable steps\b/i.test(text) || /(^|\n)\s*#{1,3}\s*next steps\b/i.test(text);
+                    const hasPredictiveModelSection = /(^|\n)\s*#{1,3}\s*predictive model\b/i.test(text);
+                    const hasTensionResolutionSection = /(^|\n)\s*#{1,3}\s*(prediction errors?|tension detection|tension resolution)\b/i.test(text) || /\bprediction error\b/i.test(lower);
+                    const hasContextHierarchySection = /(^|\n)\s*#{1,3}\s*contextual hierarchy\b/i.test(text) || /\bweighting dimensions\b/i.test(lower) || /\bauthority\b.*\brecency\b.*\brelevance\b/i.test(lower);
+                    const listStyleDocNarration = /\b(doc(?:ument)?\s*[a-z0-9]+\s+says|doc(?:ument)?\s*[a-z0-9]+\s+states)\b/i.test(text);
                     const hasMentalModelSection = /(^|\n)\s*#{1,3}\s*mental model\b/i.test(text) || /\bmental model\b/i.test(lower);
                     const hasHumanLoopSection = /(^|\n)\s*#{1,3}\s*human cognitive processing loop\b/i.test(text);
                     const hasEvidenceSection = /(^|\n)\s*#{1,3}\s*(evidence-based expert analysis|evidence synthesis|evidence-based answer|evidence-based analysis)\b/i.test(text) || /\bevidence[- ]based\b/i.test(lower);
@@ -4779,6 +4977,10 @@ ${attachmentEvidence.contextText}`);
                         /(contradicts|modifies|limits|exceptions?)/i.test(lower) &&
                         /while the primary evidence suggests[\s\S]{0,300}\[Source:/i.test(text);
                     const orderedSections = [
+                        'executive summary',
+                        'predictive model',
+                        'prediction errors',
+                        'contextual hierarchy',
                         'mental model',
                         'human cognitive processing loop',
                         'analytical framework',
@@ -4822,6 +5024,14 @@ ${attachmentEvidence.contextText}`);
                     };
 
                     const reasons = [];
+                    if (!hasExecutiveSummarySection) reasons.push('Missing "Executive Summary" section.');
+                    if (!hasDecisionFirst) reasons.push('Output must start with a definitive decision before supporting detail.');
+                    if (!hasReasoningPathSection) reasons.push('Missing explicit "Reasoning Path" section.');
+                    if (!hasActionableStepsSection) reasons.push('Missing explicit actionable steps / next steps section.');
+                    if (!hasPredictiveModelSection) reasons.push('Missing "Predictive Model" section.');
+                    if (!hasTensionResolutionSection) reasons.push('Missing prediction-error/tension-resolution section.');
+                    if (!hasContextHierarchySection) reasons.push('Missing contextual hierarchy weighting (authority/recency/relevance) section.');
+                    if (listStyleDocNarration) reasons.push('Response uses list-style document narration ("Doc A says..."), which violates synthesis rule.');
                     if (!hasMentalModelSection) reasons.push('Missing explicit "Mental Model" section.');
                     if (!hasHumanLoopSection) reasons.push('Missing "Human Cognitive Processing Loop" section.');
                     if (!hasEvidenceSection) reasons.push('Missing explicit evidence-based analysis section.');
@@ -4868,6 +5078,14 @@ ${attachmentEvidence.contextText}`);
                         sourceDocCount,
                         citedDocCount: citedDocs.length,
                         citedDocs: citedDocs.slice(0, 8),
+                        hasExecutiveSummarySection,
+                        hasDecisionFirst,
+                        hasReasoningPathSection,
+                        hasActionableStepsSection,
+                        hasPredictiveModelSection,
+                        hasTensionResolutionSection,
+                        hasContextHierarchySection,
+                        listStyleDocNarration,
                         reasoningSignals,
                         minReasoningSignals,
                         hasFrameworkSection,
@@ -4909,6 +5127,13 @@ ${attachmentEvidence.contextText}`);
                         'Do NOT summarize. Produce a cohesive analyst brief that separates evidence from inference and then reasons to a decision/action.',
                         '',
                         'Mandatory output scaffold:',
+                        '## Executive Summary',
+                        'Decision: <definitive answer>',
+                        'Reasoning Path: <why this conclusion wins>',
+                        'Actionable Steps: <what to do next>',
+                        '## Predictive Model',
+                        '## Prediction Errors, Tension Detection & Resolution',
+                        '## Contextual Hierarchy',
                         '## Mental Model',
                         '## Human Cognitive Processing Loop',
                         '## Analytical Framework',
@@ -5047,6 +5272,11 @@ ${attachmentEvidence.contextText}`);
                     }).filter(Boolean);
 
                     const lines = [
+                        '## Executive Summary',
+                        'Decision: A definitive expert conclusion is deferred because required evidence is incomplete.',
+                        'Reasoning Path: Current retrieval does not meet cross-source sufficiency and evidence-completeness thresholds for this query.',
+                        'Actionable Steps: Provide the missing documents/data listed below, then rerun synthesis for a fully grounded answer.',
+                        '',
                         '## Mental Model',
                         '- Status: Incomplete for a reliable expert conclusion.',
                         `- Query focus: ${query}`,
@@ -5208,10 +5438,12 @@ ${attachmentEvidence.contextText}`);
                 const retrievalQuery = this.superBrainResolveQueryFromSession(query);
                 const baseIntent = options.intent || this.detectQueryIntent(query);
                 const intent = { ...baseIntent, broadCoverage: true };
+                const intentGraph = this.superBrainBuildIntentGraph(retrievalQuery);
+                const predictiveModel = this.superBrainBuildPredictiveModel(retrievalQuery, intentGraph, intent);
                 const corpusSize = this.allChunks.length;
                 const targetTopK = topK ?? (corpusSize <= 80 ? FULL_SCAN_MIN_TOPK : Math.min(FULL_SCAN_MAX_TOPK, Math.ceil(corpusSize * 0.09)));
 
-                const base = await original.call(this, retrievalQuery, Math.max(targetTopK, FULL_SCAN_MIN_TOPK), { ...options, intent });
+                const base = await original.call(this, retrievalQuery, Math.max(targetTopK, FULL_SCAN_MIN_TOPK), { ...options, intent, predictiveModel });
                 const anchors = this.getPerDocumentAnchors(retrievalQuery, intent);
                 let merged = this.mergeUniqueChunks(base, anchors, Math.max(targetTopK * 2, 90));
                 const bridges = this.expandImplicitLinks(merged, retrievalQuery, MAX_CONCEPT_EXPANSION);
@@ -5221,15 +5453,16 @@ ${attachmentEvidence.contextText}`);
                     retrievalQuery,
                     merged,
                     targetTopK,
-                    options,
+                    { ...options, predictiveModel },
                     intent,
                     original
                 );
                 merged = refinement.chunks;
+                const effectivePredictiveModel = refinement?.predictiveModel || predictiveModel;
                 const adversarial = await this.superBrainRunAdversarialRetrieval(
                     retrievalQuery,
                     merged,
-                    options,
+                    { ...options, predictiveModel: effectivePredictiveModel },
                     intent,
                     original
                 );
@@ -5300,6 +5533,8 @@ ${attachmentEvidence.contextText}`);
                 this.lastActivationReport.currentCrossSourceDocs = new Set(out.map(item => item.filename)).size;
                 this.lastActivationReport.adversarialPasses = adversarial?.passes || 0;
                 this.lastActivationReport.adversarialChunks = adversarialChunks.length;
+                this.lastActivationReport.predictiveModel = effectivePredictiveModel;
+                this.lastPredictiveModel = effectivePredictiveModel;
                 this.lastAdversarialRetrieval = {
                     query,
                     passes: adversarial?.passes || 0,
@@ -5328,25 +5563,30 @@ ${attachmentEvidence.contextText}`);
                 }
                 const sections = [
                     'Mandatory cognitive scaffold for this answer:',
-                    '1) Mental Model',
-                    '2) Human Cognitive Processing Loop (Evidence intake -> Attention filtering -> Perception/interpretation -> System1/System2 reasoning -> Decision/action -> Feedback loop -> Bias check)',
-                    '3) Analytical Framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness)',
-                    '4) Explicitly Stated Facts',
-                    '5) Inferred Implications',
-                    '6) Evidence-Based Expert Analysis'
+                    '1) Executive Summary (Decision first, then Reasoning Path, then Actionable Steps)',
+                    '2) Predictive Model (pre-evidence expectation)',
+                    '3) Prediction Errors, Tension Detection & Resolution',
+                    '4) Contextual Hierarchy (authority, recency, contextual relevance; explicitly state which source wins and why)',
+                    '5) Mental Model',
+                    '6) Human Cognitive Processing Loop (Evidence intake -> Attention filtering -> Perception/interpretation -> System1/System2 reasoning -> Decision/action -> Feedback loop -> Bias check)',
+                    '7) Analytical Framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness)',
+                    '8) Explicitly Stated Facts',
+                    '9) Inferred Implications',
+                    '10) Evidence-Based Expert Analysis'
                 ];
                 if (decisionMode) {
-                    sections.push('7) Options & Trade-offs (at least 2 options)');
-                    sections.push('8) Recommendation');
-                    sections.push('9) Risks');
+                    sections.push('11) Options & Trade-offs (at least 2 options)');
+                    sections.push('12) Recommendation');
+                    sections.push('13) Risks');
                 }
                 if (perspectiveMode) {
-                    sections.push(`${decisionMode ? '10' : '7'}) Perspective Analysis (at least two viewpoints)`);
+                    sections.push(`${decisionMode ? '14' : '11'}) Perspective Analysis (at least two viewpoints)`);
                 }
-                sections.push(`${decisionMode ? (perspectiveMode ? '11' : '10') : (perspectiveMode ? '8' : '7')}) Uncertainties & Missing Information`);
+                sections.push(`${decisionMode ? (perspectiveMode ? '15' : '14') : (perspectiveMode ? '12' : '11')}) Uncertainties & Missing Information`);
                 if (adversarialMode) {
                     sections.push('Include explicit adversarial sentence: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
                 }
+                sections.push('Synthesis rule: do NOT write "Doc A says X, Doc B says Y". Every conclusion sentence must integrate multiple evidence points.');
                 sections.push('Do not output a summary-only response.');
                 const scaffold = sections.join('\n');
                 return `${base}\n\n${scaffold}`;
@@ -5363,6 +5603,9 @@ ${attachmentEvidence.contextText}`);
                     strictSourceOnly: true,
                     freshPassRequired: true,
                     requireUncertaintySection: true,
+                    executiveSummaryRequired: true,
+                    predictiveCodingMode: true,
+                    system2AnalyticalMode: true,
                     decisionMode,
                     perspectiveMode,
                     frameworkMode,
@@ -5399,7 +5642,7 @@ ${attachmentEvidence.contextText}`);
                     '',
                     'DECISION-QUALITY MODE:',
                     '- Build a decision framework, not a summary.',
-                    '- Include sections: Problem Framing, Human Cognitive Processing Loop, Analytical Framework, Explicitly Stated Facts, Inferred Implications, Evidence Synthesis, Options & Trade-offs, Recommendation, Risks, Uncertainties.',
+                    '- Include sections: Executive Summary, Predictive Model, Prediction Errors/Tension Resolution, Contextual Hierarchy, Problem Framing, Human Cognitive Processing Loop, Analytical Framework, Explicitly Stated Facts, Inferred Implications, Evidence Synthesis, Options & Trade-offs, Recommendation, Risks, Uncertainties.',
                     '- For each option, provide source-grounded pros/cons with citations.'
                 ].join('\n') : '';
                 const superRules = [
@@ -5411,8 +5654,11 @@ ${attachmentEvidence.contextText}`);
                     '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
                     '- Human cognition emulation loop (mandatory in answer): Evidence Intake -> Attention Filtering -> Perception/Interpretation -> Dual-process reasoning (System1 + System2) -> Decision/Action -> Feedback Loop -> Bias check.',
                     '- Use concise chain-of-thought style decomposition via explicit sectioned reasoning, grounded only in cited evidence.',
+                    '- Predictive coding mandate: start with a "Predictive Model" hypothesis BEFORE evidence synthesis, then explicitly compute prediction errors and resolve tension.',
                     '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
-                    '- Hard response scaffold for prose answers: Mental Model -> Human Cognitive Processing Loop -> Analytical Framework -> Explicitly Stated Facts -> Inferred Implications -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
+                    '- Hard response scaffold for prose answers: Executive Summary (Decision first) -> Predictive Model -> Prediction Errors/Tension Resolution -> Contextual Hierarchy -> Mental Model -> Human Cognitive Processing Loop -> Analytical Framework -> Explicitly Stated Facts -> Inferred Implications -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
+                    '- Executive summary mandate: first section must start with a definitive decision, followed by reasoning path and actionable steps.',
+                    '- Synthesis rule: do not produce "Doc A says..., Doc B says..." style narration; each conclusion sentence must integrate multiple evidence points.',
                     '- Use one explicit analytical framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness) as the logic skeleton.',
                     '- Explicitly separate direct evidence from inference using section labels: "Explicitly Stated Facts" and "Inferred Implications".',
                     '- Run adversarial synthesis: include the sentence "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
@@ -5446,6 +5692,8 @@ ${attachmentEvidence.contextText}`);
                 return [
                     base,
                     superRules,
+                    corpusStats.superBrainPredictiveBlock || '',
+                    corpusStats.superBrainHierarchyBlock || '',
                     corpusStats.superBrainMentalModelBlock || '',
                     corpusStats.superBrainPerspectiveBlock || '',
                     corpusStats.superBrainAdversarialBlock || '',
@@ -5498,6 +5746,10 @@ ${attachmentEvidence.contextText}`);
                 if (appRetriever?.lastActivationReport) {
                     localStats.activationReport = { ...appRetriever.lastActivationReport };
                 }
+                let predictiveModel = localStats.superBrainPredictiveModel || null;
+                if (!predictiveModel && appRetriever?.lastPredictiveModel) {
+                    predictiveModel = appRetriever.lastPredictiveModel;
+                }
                 let adversarialRetrieval = localStats.superBrainAdversarialRetrieval || null;
                 if (!adversarialRetrieval && appRetriever?.lastAdversarialRetrieval) {
                     adversarialRetrieval = appRetriever.lastAdversarialRetrieval;
@@ -5529,10 +5781,22 @@ ${attachmentEvidence.contextText}`);
                         chunks: dedupedSources.slice(0, Math.min(MAX_ADVERSARIAL_CHUNKS, 8))
                     };
                 }
+                if (!predictiveModel) {
+                    predictiveModel = {
+                        query,
+                        anticipatedConclusion: `Likely requires balancing baseline rules with context-specific exceptions for: ${query}`,
+                        hypotheses: [],
+                        expectedEvidenceNeeds: [],
+                        weightingPriors: {}
+                    };
+                }
+                localStats.superBrainPredictiveModel = predictiveModel;
                 localStats.superBrainAdversarialRetrieval = adversarialRetrieval;
                 localStats.superBrainContradictionBlock = this.superBrainBuildContradictionBlock(query, dedupedSources);
                 localStats.superBrainAdversarialBlock = this.superBrainBuildAdversarialEvidenceBlock(query, adversarialRetrieval);
                 localStats.superBrainPerspectiveBlock = this.superBrainBuildPerspectiveEvidenceBlock(query, dedupedSources, requestProfile);
+                localStats.superBrainPredictiveBlock = this.superBrainBuildPredictiveResolutionBlock(query, predictiveModel, dedupedSources);
+                localStats.superBrainHierarchyBlock = this.superBrainBuildContextualHierarchyBlock(query, dedupedSources);
                 const mentalModel = refinement?.model || await this.superBrainBuildMentalModel(query, dedupedSources, localStats.activationReport);
                 localStats.superBrainMentalModel = mentalModel;
                 localStats.superBrainMentalModelBlock = this.superBrainFormatModelBlock(mentalModel);
@@ -5580,6 +5844,10 @@ ${attachmentEvidence.contextText}`);
                         '1) Maintain strict source grounding.',
                         '2) Increase claim-level citations where factual statements are made.',
                         '3) Structure output as:',
+                        '   - Executive Summary (Decision first, Reasoning Path, Actionable Steps)',
+                        '   - Predictive Model',
+                        '   - Prediction Errors, Tension Detection & Resolution',
+                        '   - Contextual Hierarchy',
                         '   - Mental Model',
                         '   - Human Cognitive Processing Loop (evidence intake, attention filtering, perception/interpretation, System1/System2 reasoning, decision/action, feedback loop, bias check)',
                         '   - Analytical Framework',
@@ -5589,9 +5857,10 @@ ${attachmentEvidence.contextText}`);
                         '   - Uncertainties & Missing Information',
                         '4) Do not summarize only; provide reasoning, trade-offs, perspective analysis, and recommended action when the question asks for decisions.',
                         '5) Include adversarial sentence with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
-                        '6) Use prior chat memory only for continuity; do not treat it as factual evidence or hidden knowledge.',
-                        '7) Normalize all citations to exact format [Source: filename, page X, "brief relevant quote"].',
-                        `8) Fix cognitive-depth gate failures: ${(depthGate?.reasons || []).slice(0, 6).join(' | ') || 'None detected'}.`
+                        '6) Avoid list-style narration like "Doc A says...". Integrate multiple evidence points per conclusion sentence.',
+                        '7) Use prior chat memory only for continuity; do not treat it as factual evidence or hidden knowledge.',
+                        '8) Normalize all citations to exact format [Source: filename, page X, "brief relevant quote"].',
+                        `9) Fix cognitive-depth gate failures: ${(depthGate?.reasons || []).slice(0, 6).join(' | ') || 'None detected'}.`
                     ].join('\n');
                     const repaired = await this.verifyAndRepairAnswer(
                         query,
@@ -5690,6 +5959,8 @@ ${attachmentEvidence.contextText}`);
                             probes: localStats.superBrainAdversarialRetrieval?.probes || [],
                             chunks: localStats.superBrainAdversarialRetrieval?.chunks?.length || 0
                         },
+                        predictiveModel: localStats.superBrainPredictiveModel || null,
+                        hierarchyBlockIncluded: !!localStats.superBrainHierarchyBlock,
                         perspectiveMode: !!requestProfile?.perspectiveMode
                     }
                 };
