@@ -108,6 +108,31 @@ The current implementation hard-wires previously fragile features:
 
 ---
 
+## Human-cognition alignment update
+
+The cognitive layer now emphasizes **latent processing behavior** rather than forcing visible keyword headers.
+
+What changed:
+
+- Reasoning/depth gates now score:
+  - direct answer clarity,
+  - evidence integration,
+  - counterevidence handling,
+  - uncertainty calibration,
+  - decision trade-off quality,
+  instead of requiring fixed section titles.
+- Repair rewrites now request **natural expert communication** (answer first, rationale, limits), not mandatory scaffold blocks.
+- Prompt policy now asks the model to run an internal cognitive loop:
+  - recognize the decision/problem,
+  - gather and filter relevant evidence,
+  - evaluate options and conflicts,
+  - execute recommendation logic,
+  - reflect with uncertainty + feedback.
+
+This is closer to the decision/reasoning principles described in the linked human-cognition/problem-solving references and avoids turning cognition into a header template.
+
+---
+
 ## Nature paper inspiration
 
 This patch’s cognition prior is explicitly aligned with:

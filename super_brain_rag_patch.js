@@ -964,7 +964,7 @@ ${evidenceDigest}`
                     added += 1;
                     if (added >= maxItems) break;
                 }
-                lines.push('- Required final-answer line: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                lines.push('- Final answer should naturally integrate contradictory/limiting evidence with citation before confidence statement.');
                 return lines.join('\n');
             };
         }
@@ -1204,7 +1204,6 @@ ${evidenceDigest}`
                 const text = String(responseText || '');
                 const lower = safeLower(text);
                 const nonEmptyLines = text.split('\n').map(line => line.trim()).filter(Boolean);
-                const firstLine = nonEmptyLines[0] || '';
                 const firstParagraph = text.trim().slice(0, 260);
                 const broadOrDecision = !!instructionProfile?.decisionMode || /\b(overall|across|entire|comprehensive|compare|contrast|decision|recommend|trade-?off)\b/i.test(String(query || ''));
                 const sourceDocCount = new Set((sources || []).map(item => item?.filename).filter(Boolean)).size;
@@ -1212,23 +1211,10 @@ ${evidenceDigest}`
                 const reasoningSignals = (lower.match(/\b(because|therefore|however|whereas|if|then|trade-?off|constraint|depends on|due to|implies|consequently|in turn)\b/g) || []).length;
                 const optionBulletSignals = (text.match(/^\s*(?:[-*]|\d+\.)\s+(?:option|approach|alternative|path|strategy)\b/gi) || []).length;
                 const optionLabelSignals = (text.match(/\boption\s*(?:1|2|3|a|b|c)\b/gi) || []).length;
-                const hasExecutiveSummarySection = /(^|\n)\s*#{1,3}\s*executive summary\b/i.test(text);
-                const hasDecisionFirst = /\bdecision\s*:/i.test(firstLine) || /^\s*##\s*executive summary\b/i.test(firstLine) || /\bdecision\s*:/i.test(firstParagraph);
-                const hasReasoningPathSection = /(^|\n)\s*#{1,3}\s*reasoning path\b/i.test(text) || /\breasoning path\s*:/i.test(lower);
-                const hasActionableStepsSection = /(^|\n)\s*#{1,3}\s*actionable steps\b/i.test(text) || /(^|\n)\s*#{1,3}\s*next steps\b/i.test(text);
-                const hasPredictiveModelSection = /(^|\n)\s*#{1,3}\s*predictive model\b/i.test(text);
-                const hasTensionResolutionSection = /(^|\n)\s*#{1,3}\s*(prediction errors?|tension detection|tension resolution)\b/i.test(text) || /\bprediction error\b/i.test(lower);
-                const hasContextHierarchySection = /(^|\n)\s*#{1,3}\s*contextual hierarchy\b/i.test(text) || /\bweighting dimensions\b/i.test(lower) || /\bauthority\b.*\brecency\b.*\brelevance\b/i.test(lower);
                 const listStyleDocNarration = /\b(doc(?:ument)?\s*[a-z0-9]+\s+says|doc(?:ument)?\s*[a-z0-9]+\s+states)\b/i.test(text);
-                const hasMentalModelSection = /(^|\n)\s*#{1,3}\s*mental model\b/i.test(text) || /\bmental model\b/i.test(lower);
-                const hasHumanLoopSection = /(^|\n)\s*#{1,3}\s*human cognitive processing loop\b/i.test(text);
-                const hasEvidenceSection = /(^|\n)\s*#{1,3}\s*(evidence-based expert analysis|evidence synthesis|evidence-based answer|evidence-based analysis)\b/i.test(text) || /\bevidence[- ]based\b/i.test(lower);
-                const hasFrameworkSection = /(^|\n)\s*#{1,3}\s*(analytical framework|pros\s*\/\s*cons|pros and cons|stakeholder analysis|causal chain|strengths?\s*\/\s*weaknesses?|swot)\b/i.test(text) ||
-                    (/\bpros\b/i.test(lower) && /\bcons\b/i.test(lower));
-                const hasExplicitFactsSection = /(^|\n)\s*#{1,3}\s*(explicit(?:ly)? stated facts|explicit facts)\b/i.test(text) || /\bFact:\b/.test(text);
-                const hasInferredImplicationsSection = /(^|\n)\s*#{1,3}\s*(inferred implications|inferences?)\b/i.test(text) || /\bInference:\b/.test(text);
-                const hasFactInferenceDistinction = hasExplicitFactsSection && hasInferredImplicationsSection;
-                const hasUncertaintySection = /(^|\n)\s*#{1,3}\s*uncertainties?\s*&\s*missing information\b/i.test(text) || /uncertaint|missing information|evidence gap|cannot fully confirm/i.test(lower);
+                const hasDirectAnswerFirst = /\b(recommend|decision|best option|most likely|overall|therefore|yes|no)\b/i.test(firstParagraph);
+                const hasCounterEvidence = /\b(however|although|on the other hand|counter|exception|conflict|trade-?off|despite)\b/i.test(lower);
+                const hasUncertaintySection = /uncertaint|missing information|evidence gap|cannot fully confirm|insufficient evidence|confidence/i.test(lower);
                 const minReasoningSignals = instructionProfile?.decisionMode ? MIN_DECISION_REASONING_SIGNALS : MIN_ANALYSIS_REASONING_SIGNALS;
                 const hasReasoningDepth = reasoningSignals >= minReasoningSignals;
                 const coverageTarget = typeof CLAIM_CITATION_TARGET === 'number' ? CLAIM_CITATION_TARGET : 0.55;
@@ -1239,31 +1225,12 @@ ${evidenceDigest}`
                 const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
                 const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                 const adversarialMode = !!instructionProfile?.adversarialMode || broadOrDecision;
-                const perspectiveMentions = (text.match(/\bfrom perspective\s+[a-z0-9]/gi) || []).length;
-                const hasPerspectiveSection = /(^|\n)\s*#{1,3}\s*(perspective analysis|stakeholder perspectives?|multi-?perspective)\b/i.test(text) || perspectiveMentions >= 2;
-                const hasAdversarialLine = /while the primary evidence suggests/i.test(lower) &&
-                    /(contradicts|modifies|limits|exceptions?)/i.test(lower) &&
-                    /while the primary evidence suggests[\s\S]{0,300}\[Source:/i.test(text);
-                const orderedSections = [
-                    'executive summary',
-                    'predictive model',
-                    'prediction errors',
-                    'contextual hierarchy',
-                    'mental model',
-                    'human cognitive processing loop',
-                    'analytical framework',
-                    'explicitly stated facts',
-                    'inferred implications',
-                    'evidence-based expert analysis'
-                ];
-                const sectionPositions = orderedSections.map(section => lower.indexOf(section));
-                let cohesiveOrder = true;
-                for (let i = 1; i < sectionPositions.length; i++) {
-                    if (sectionPositions[i - 1] >= 0 && sectionPositions[i] >= 0 && sectionPositions[i] < sectionPositions[i - 1]) {
-                        cohesiveOrder = false;
-                        break;
-                    }
-                }
+                const perspectiveMentions = (text.match(/\bfrom perspective\s+[a-z0-9]/gi) || []).length + (text.match(/\b(stakeholder|team|user|operations|finance|compliance)\b/gi) || []).length;
+                const hasPerspectiveEvidence = perspectiveMentions >= 2;
+                const hasAdversarialLine = (
+                    /while the primary evidence suggests/i.test(lower) ||
+                    /\b(however|although|on the other hand|counter|contradict|limit|exception)\b/i.test(lower)
+                ) && /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i.test(text);
                 const stageChecks = {
                     hasAttentionFilter: /\b(attention|salien|prioriti|signal-to-noise|noise filtering|filtering)\b/i.test(lower),
                     hasPerceptionInterpretation: /\b(perception|interpret|contextual|context interpretation|sensemaking|meaning)\b/i.test(lower),
@@ -1292,48 +1259,26 @@ ${evidenceDigest}`
                 };
 
                 const reasons = [];
-                if (!hasExecutiveSummarySection) reasons.push('Missing "Executive Summary" section.');
-                if (!hasDecisionFirst) reasons.push('Output must start with a definitive decision before supporting detail.');
-                if (!hasReasoningPathSection) reasons.push('Missing explicit "Reasoning Path" section.');
-                if (!hasActionableStepsSection) reasons.push('Missing explicit actionable steps / next steps section.');
-                if (!hasPredictiveModelSection) reasons.push('Missing "Predictive Model" section.');
-                if (!hasTensionResolutionSection) reasons.push('Missing prediction-error/tension-resolution section.');
-                if (!hasContextHierarchySection) reasons.push('Missing contextual hierarchy weighting (authority/recency/relevance) section.');
+                if (!hasDirectAnswerFirst) reasons.push('Start with a direct answer before detailing rationale.');
                 if (listStyleDocNarration) reasons.push('Response uses list-style document narration ("Doc A says..."), which violates synthesis rule.');
-                if (!hasMentalModelSection) reasons.push('Missing explicit "Mental Model" section.');
-                if (!hasHumanLoopSection) reasons.push('Missing "Human Cognitive Processing Loop" section.');
-                if (!hasEvidenceSection) reasons.push('Missing explicit evidence-based analysis section.');
-                if (!hasFrameworkSection) reasons.push('Missing a structured analytical framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness).');
-                if (!hasFactInferenceDistinction) reasons.push('Missing explicit distinction between "Explicitly Stated Facts" and "Inferred Implications".');
-                if (!hasUncertaintySection) reasons.push('Missing "Uncertainties & Missing Information" section.');
+                if (!hasCounterEvidence && broadOrDecision) reasons.push('Include competing evidence or exceptions before final conclusion.');
+                if (!hasUncertaintySection) reasons.push('Missing uncertainty/confidence handling.');
                 if (!hasReasoningDepth) reasons.push('Reasoning depth is weak (insufficient causal/trade-off signals).');
                 if (!hasCitationCoverage) reasons.push('Claim citation coverage is below required threshold.');
                 if (!hasCitationPrecision) reasons.push('Citation precision is below required threshold.');
                 if (!crossSourceSatisfied) reasons.push('Cross-source reasoning is weak (insufficient distinct cited documents).');
-                if (!cohesiveOrder) reasons.push('Output is not organized as a cohesive analyst brief (section order is inconsistent).');
-                if (adversarialMode && !hasAdversarialLine) reasons.push('Missing required adversarial statement ("While the primary evidence suggests X ... contradicts/modifies ...").');
-                if (perspectiveMode && !hasPerspectiveSection) reasons.push('Perspective-taking is missing (need at least two stakeholder viewpoints).');
-                if (stageSignalCount < minStageSignals) {
-                    reasons.push(`Human cognitive cycle is incomplete (${stageSignalCount}/${minStageSignals} stage signals).`);
-                }
-                if (missingRequiredStages.length) {
-                    reasons.push(`Missing required cognitive stages: ${missingRequiredStages.map(key => stageLabels[key] || key).join(', ')}.`);
-                }
-                if (instructionProfile?.decisionMode && !stageChecks.hasDualProcess) {
-                    reasons.push('Decision analysis must include dual-process reasoning (fast hypothesis + slow analytical validation).');
-                }
-                if (!stageChecks.hasBiasCheck) {
-                    reasons.push('Missing heuristic/bias risk check and mitigation.');
-                }
+                if (adversarialMode && !hasAdversarialLine) reasons.push('Missing adversarial integration of contradictory evidence with citation.');
+                if (perspectiveMode && !hasPerspectiveEvidence) reasons.push('Perspective-taking is missing (need at least two stakeholder viewpoints).');
+                if (instructionProfile?.decisionMode && stageSignalCount === 0) reasons.push('Decision response should show at least one explicit reasoning/monitoring step, not only a verdict.');
 
                 const decisionChecks = {
-                    hasOptionsTradeoffs: /(^|\n)\s*#{1,3}\s*(options?\s*&\s*trade-?offs?|trade-?offs?|options?)\b/i.test(text) || /trade-?off|option|alternative|pros|cons/i.test(lower),
-                    hasRecommendation: /(^|\n)\s*#{1,3}\s*recommendation\b/i.test(text) || /\brecommend(?:ed|ation)?\b/i.test(lower),
-                    hasRisks: /(^|\n)\s*#{1,3}\s*risks?\b/i.test(text) || /\brisk(s)?\b/i.test(lower),
+                    hasOptionsTradeoffs: /trade-?off|option|alternative|pros|cons|path|scenario/i.test(lower),
+                    hasRecommendation: /\brecommend(?:ed|ation)?|best option|preferred option|choose|decision\b/i.test(lower),
+                    hasRisks: /\brisk(s)?|downside|failure mode|cost\b/i.test(lower),
                     hasMultipleOptions: optionBulletSignals >= 2 || optionLabelSignals >= 2
                 };
                 if (instructionProfile?.decisionMode) {
-                    if (!decisionChecks.hasOptionsTradeoffs) reasons.push('Decision output missing "Options & Trade-offs".');
+                    if (!decisionChecks.hasOptionsTradeoffs) reasons.push('Decision output missing trade-off comparison.');
                     if (!decisionChecks.hasRecommendation) reasons.push('Decision output missing explicit recommendation.');
                     if (!decisionChecks.hasRisks) reasons.push('Decision output missing explicit risk analysis.');
                     if (!decisionChecks.hasMultipleOptions) reasons.push('Decision output does not compare multiple concrete options.');
@@ -1346,24 +1291,16 @@ ${evidenceDigest}`
                     sourceDocCount,
                     citedDocCount: citedDocs.length,
                     citedDocs: citedDocs.slice(0, 8),
-                    hasExecutiveSummarySection,
-                    hasDecisionFirst,
-                    hasReasoningPathSection,
-                    hasActionableStepsSection,
-                    hasPredictiveModelSection,
-                    hasTensionResolutionSection,
-                    hasContextHierarchySection,
+                    hasDirectAnswerFirst,
+                    hasCounterEvidence,
                     listStyleDocNarration,
                     reasoningSignals,
                     minReasoningSignals,
-                    hasFrameworkSection,
-                    hasFactInferenceDistinction,
                     perspectiveMode,
-                    hasPerspectiveSection,
+                    hasPerspectiveEvidence,
                     perspectiveMentions,
                     adversarialMode,
                     hasAdversarialLine,
-                    cohesiveOrder,
                     crossSourceExpected,
                     crossSourceSatisfied,
                     stageChecks,
@@ -1392,54 +1329,30 @@ ${evidenceDigest}`
                 const lines = [
                     'ANALYSIS-DEPTH REWRITE GATE (MANDATORY)',
                     `Question: ${query}`,
-                    'Do NOT summarize. Produce a cohesive analyst brief that separates evidence from inference and then reasons to a decision/action.',
+                    'Rewrite as natural human expert communication (not a forced heading template).',
                     '',
-                    'Mandatory output scaffold:',
-                    '## Executive Summary',
-                    'Decision: <definitive answer>',
-                    'Reasoning Path: <why this conclusion wins>',
-                    'Actionable Steps: <what to do next>',
-                    '## Predictive Model',
-                    '## Prediction Errors, Tension Detection & Resolution',
-                    '## Contextual Hierarchy',
-                    '## Mental Model',
-                    '## Human Cognitive Processing Loop',
-                    '## Analytical Framework',
-                    '## Explicitly Stated Facts',
-                    '## Inferred Implications',
-                    '## Evidence-Based Expert Analysis'
+                    'Communication policy:',
+                    '- Begin with a direct answer in plain language.',
+                    '- Explain reasoning as an integrated narrative that combines supporting and conflicting evidence.',
+                    '- Separate observed facts from inferred implications in prose (do not invent facts).',
+                    '- Include uncertainty/confidence and what evidence is still missing.',
+                    '- You may use short bullets or mini-headings only when they improve clarity; no mandatory section labels.'
                 ];
-                lines.push('- In "Human Cognitive Processing Loop", explicitly include:');
-                lines.push('  1) Evidence Intake (sensation proxy from retrieved documents)');
-                lines.push('  2) Attention Filtering (signal vs noise)');
-                lines.push('  3) Perception & Context Interpretation');
-                lines.push('  4) Dual-process reasoning (System 1 hypothesis + System 2 analytical verification)');
-                lines.push('  5) Decision & Action path');
-                lines.push('  6) Feedback Loop (what to monitor and how model updates)');
-                lines.push('  7) Heuristic/Bias risk check and mitigation');
                 if (decisionMode) {
-                    lines.push('## Options & Trade-offs');
-                    lines.push('## Recommendation');
-                    lines.push('## Risks');
+                    lines.push('- Compare at least two concrete options with trade-offs before final recommendation.');
+                    lines.push('- Include execution risk and mitigation for the selected option.');
                 }
-                if (perspectiveMode) lines.push('## Perspective Analysis');
-                lines.push('## Uncertainties & Missing Information');
+                if (perspectiveMode) lines.push('- Incorporate at least two stakeholder viewpoints in the reasoning narrative.');
                 lines.push('');
                 lines.push(`Minimum citation target for this rewrite: ${minCitations} citations in exact format [Source: filename, page X, "brief relevant quote"].`);
                 if (sourceDocCount >= MIN_CROSS_SOURCE_DOCS) {
                     lines.push(`Cross-source rule: cite at least ${Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount)} distinct source documents when giving broad or decision conclusions.`);
                 }
-                if (decisionMode) {
-                    lines.push('Decision rule: compare at least two concrete options with source-grounded trade-offs before recommending.');
-                }
-                lines.push('Coherence rule: keep section order exactly as scaffolded to produce one cohesive analyst brief (do not mix sections).');
-                lines.push('Framework rule: use one structured framework explicitly (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness).');
-                lines.push('Fact-vs-inference rule: every inference must be linked to cited explicit facts.');
                 if (perspectiveMode) {
-                    lines.push('Perspective rule: include at least two viewpoints with "From Perspective A..." and "From Perspective B..." plus citations.');
+                    lines.push('Perspective rule: include at least two stakeholder viewpoints with citations.');
                 }
                 if (adversarialMode) {
-                    lines.push('Adversarial rule: include this exact pattern with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                    lines.push('Adversarial rule: explicitly surface at least one contradictory or limiting piece of evidence with citation.');
                 }
                 const reasons = Array.isArray(depthGate?.reasons) ? depthGate.reasons.filter(Boolean) : [];
                 if (reasons.length) {
@@ -1538,50 +1451,19 @@ ${evidenceDigest}`
                     const quote = cleaned.slice(0, 110).replace(/"/g, '\'');
                     return `- ${cleaned} [Source: ${source.filename || 'Unknown'}, page ${source.page || 'N/A'}, "${quote || 'relevant quote'}"]`;
                 }).filter(Boolean);
-
                 const lines = [
-                    '## Executive Summary',
-                    'Decision: A definitive expert conclusion is deferred because required evidence is incomplete.',
-                    'Reasoning Path: Current retrieval does not meet cross-source sufficiency and evidence-completeness thresholds for this query.',
-                    'Actionable Steps: Provide the missing documents/data listed below, then rerun synthesis for a fully grounded answer.',
+                    'I cannot give a high-confidence final conclusion yet because the available evidence is incomplete for this question.',
                     '',
-                    '## Mental Model',
-                    '- Status: Incomplete for a reliable expert conclusion.',
-                    `- Query focus: ${query}`,
-                    `- Current entities: ${(model?.entities || []).slice(0, 8).join(', ') || 'N/A'}`,
-                    `- Current concepts: ${(model?.concepts || []).slice(0, 10).join(', ') || 'N/A'}`,
+                    `Query focus: ${query}`,
+                    `Current coverage: ${completeness?.docCount || 0}/${completeness?.requiredDocs || 1} distinct documents (reviewed chunks: ${completeness?.sourceCount || 0}).`,
+                    completeness?.activationCoverage ? `Activation coverage: ${completeness.activationCoverage}%.` : 'Activation coverage: N/A.',
                     '',
-                    '## Evidence-Based Status',
-                    `- Source chunks reviewed: ${completeness?.sourceCount || 0}`,
-                    `- Distinct documents covered: ${completeness?.docCount || 0}/${completeness?.requiredDocs || 1} required`,
-                    completeness?.activationCoverage ? `- Activation coverage: ${completeness.activationCoverage}%` : '- Activation coverage: N/A'
+                    'What I can ground right now:'
                 ];
-                if (evidenceLines.length) {
-                    lines.push('- Current grounded evidence:');
-                    lines.push(...evidenceLines);
-                } else {
-                    lines.push('- No citable evidence is currently available for this question.');
-                }
+                if (evidenceLines.length) lines.push(...evidenceLines);
+                else lines.push('- No citable evidence is currently available for this question.');
 
-                lines.push('', '## Explicitly Stated Facts (Available)');
-                if (evidenceLines.length) {
-                    lines.push('- The evidence bullets above are directly supported by cited excerpts.');
-                } else {
-                    lines.push('- No explicit facts can be asserted yet with citation confidence.');
-                }
-                lines.push('', '## Inferred Implications (Provisional)');
-                lines.push('- Any downstream implications are provisional until additional source material is provided.');
-
-                lines.push('', '## Human Cognitive Processing Loop Status');
-                lines.push('- Evidence intake (sensation proxy): limited by available retrieved documents.');
-                lines.push('- Attention filtering: partial; key signals identified but completeness is below threshold.');
-                lines.push('- Perception/interpretation: provisional and cannot be finalized.');
-                lines.push('- Dual-process reasoning (System1/System2): halted due to unresolved evidence gaps.');
-                lines.push('- Decision/action: deferred until required sources are provided.');
-                lines.push('- Feedback loop: upload requested documents, then rerun to update the model and recommendation.');
-                lines.push('- Bias/heuristic guard: withholding conclusion to avoid availability/confirmation bias from incomplete evidence.');
-
-                lines.push('', '## Uncertainties & Missing Information');
+                lines.push('', 'Why the conclusion is deferred:');
                 for (const reason of (completeness?.reasons || [])) lines.push(`- ${reason}`);
                 if (!completeness?.reasons?.length) lines.push('- Evidence is insufficient to produce a high-confidence answer.');
                 if (Array.isArray(model?.gaps) && model.gaps.length) {
@@ -1589,12 +1471,12 @@ ${evidenceDigest}`
                     for (const gap of model.gaps.slice(0, 6)) lines.push(`- ${gap}`);
                 }
 
-                lines.push('', '## Required Documents/Data');
+                lines.push('', 'What to provide next so I can finish the analysis:');
                 const requested = completeness?.requestedDocuments || [];
                 if (requested.length) requested.forEach((item, idx) => lines.push(`${idx + 1}. ${item}`));
                 else lines.push('1. Additional source documents that directly answer unresolved parts of the question.');
                 lines.push('');
-                lines.push('Please provide the missing documents/data so I can complete a fully grounded, cross-source expert answer with precise citations.');
+                lines.push('Once those sources are provided, I will rerun the reasoning pass and return a fully grounded recommendation with citations.');
                 return lines.join('\n');
             };
         }
@@ -1858,35 +1740,24 @@ ${evidenceDigest}`
             if (!decisionMode && !['structured prose', 'bullet list'].includes(format)) {
                 return base;
             }
-            const sections = [
-                'Mandatory cognitive scaffold for this answer:',
-                '1) Executive Summary (Decision first, then Reasoning Path, then Actionable Steps)',
-                '2) Predictive Model (pre-evidence expectation)',
-                '3) Prediction Errors, Tension Detection & Resolution',
-                '4) Contextual Hierarchy (authority, recency, contextual relevance; explicitly state which source wins and why)',
-                '5) Mental Model',
-                '6) Human Cognitive Processing Loop (Evidence intake -> Attention filtering -> Perception/interpretation -> System1/System2 reasoning -> Decision/action -> Feedback loop -> Bias check)',
-                '7) Analytical Framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness)',
-                '8) Explicitly Stated Facts',
-                '9) Inferred Implications',
-                '10) Evidence-Based Expert Analysis'
+            const guidance = [
+                'Human-like reasoning communication requirements:',
+                '- Give the answer first in natural language.',
+                '- Then explain why using integrated evidence (not document-by-document narration).',
+                '- Include at least one contradictory or limiting evidence point before the final confidence statement.',
+                '- Explicitly state uncertainty and what missing evidence would change the conclusion.'
             ];
             if (decisionMode) {
-                sections.push('11) Options & Trade-offs (at least 2 options)');
-                sections.push('12) Recommendation');
-                sections.push('13) Risks');
+                guidance.push('- Compare at least two concrete options, then recommend one with risk/mitigation.');
             }
             if (perspectiveMode) {
-                sections.push(`${decisionMode ? '14' : '11'}) Perspective Analysis (at least two viewpoints)`);
+                guidance.push('- Reflect at least two stakeholder perspectives when trade-offs are present.');
             }
-            sections.push(`${decisionMode ? (perspectiveMode ? '15' : '14') : (perspectiveMode ? '12' : '11')}) Uncertainties & Missing Information`);
             if (adversarialMode) {
-                sections.push('Include explicit adversarial sentence: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                guidance.push('- Include an adversarial check that could falsify or weaken your leading conclusion.');
             }
-            sections.push('Synthesis rule: do NOT write "Doc A says X, Doc B says Y". Every conclusion sentence must integrate multiple evidence points.');
-            sections.push('Do not output a summary-only response.');
-            const scaffold = sections.join('\n');
-            return `${base}\n\n${scaffold}`;
+            guidance.push('- Keep output natural and concise; only use headings/bullets when they improve readability.');
+            return `${base}\n\n${guidance.join('\n')}`;
         });
 
         patchMethod(CognitiveSynthesizer, 'buildInstructionProfile', (original) => function patchedBuildInstructionProfile(query) {
@@ -1900,9 +1771,11 @@ ${evidenceDigest}`
                 strictSourceOnly: true,
                 freshPassRequired: true,
                 requireUncertaintySection: true,
-                executiveSummaryRequired: true,
+                executiveSummaryRequired: false,
                 predictiveCodingMode: true,
                 system2AnalyticalMode: true,
+                preferNaturalNarrative: true,
+                avoidTemplateHeaders: true,
                 decisionMode,
                 perspectiveMode,
                 frameworkMode,
@@ -1935,38 +1808,26 @@ ${evidenceDigest}`
             const activationBlock = summarizeActivation(corpusStats.activationReport);
             const modelBlock = corpusStats.superBrainMentalModelBlock || '';
             const decisionRules = instructionProfile?.decisionMode ? [
-                'DECISION-QUALITY MODE:',
-                '- Build a decision framework, not a summary.',
-                '- Include sections: Executive Summary, Predictive Model, Prediction Errors/Tension Resolution, Contextual Hierarchy, Problem Framing, Human Cognitive Processing Loop, Analytical Framework, Explicitly Stated Facts, Inferred Implications, Evidence Synthesis, Options & Trade-offs, Recommendation, Risks, Uncertainties.',
-                '- For each option, provide source-grounded pros/cons with citations.'
+                'DECISION MODE:',
+                '- Compare at least two concrete options.',
+                '- Weigh trade-offs, risks, and constraints before recommending.',
+                '- Explain why the recommended option dominates alternatives under current evidence.'
             ].join('\n') : '';
             const cognitionRules = [
                 'STRICT EVIDENCE-GROUNDED RAG POLICY (MANDATORY)',
                 '- Use only retrieved sources from this request.',
                 '- Do not use prior chat memory as evidence.',
                 '- Prior-turn memory is allowed only for conversational continuity (co-reference, follow-up scope, user preferences).',
-                '- Do not produce summary-only output; produce expert analysis, trade-offs, decisions, and actionable recommendations.',
-                '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
-                '- Human cognition emulation loop (mandatory in answer): Evidence Intake -> Attention Filtering -> Perception/Interpretation -> Dual-process reasoning (System1 + System2) -> Decision/Action -> Feedback Loop -> Bias check.',
-                '- Use concise chain-of-thought style decomposition via explicit sectioned reasoning, grounded only in cited evidence.',
-                '- Predictive coding mandate: start with a "Predictive Model" hypothesis BEFORE evidence synthesis, then explicitly compute prediction errors and resolve tension.',
-                '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
-                '- Hard response scaffold for prose answers: Executive Summary (Decision first) -> Predictive Model -> Prediction Errors/Tension Resolution -> Contextual Hierarchy -> Mental Model -> Human Cognitive Processing Loop -> Analytical Framework -> Explicitly Stated Facts -> Inferred Implications -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
-                '- Executive summary mandate: first section must start with a definitive decision, followed by reasoning path and actionable steps.',
+                '- Do not produce summary-only output; perform reasoning and decision support.',
+                '- Run latent cognitive pipeline internally: evidence intake -> selective attention -> interpretation -> hypothesis competition -> adversarial check -> decision simulation -> uncertainty calibration -> feedback planning.',
+                '- Use predictive-processing style: compare prior expectation to observed evidence and revise conclusion when tension appears.',
+                '- For broad/decision queries, integrate multiple sources and avoid dominant single-document conclusions.',
+                '- Do not force rigid output headers unless the user explicitly asks for them.',
+                '- Communicate like a skilled human analyst: direct answer first, then rationale, then limits/uncertainty.',
                 '- Synthesis rule: do not produce "Doc A says..., Doc B says..." style narration; each conclusion sentence must integrate multiple evidence points.',
-                '- Use one explicit analytical framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness) as the logic skeleton.',
-                '- Explicitly separate direct evidence from inference using section labels: "Explicitly Stated Facts" and "Inferred Implications".',
-                '- Run adversarial synthesis: include the sentence "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
-                '- If perspective or stakeholder conflict is relevant, include at least two explicit viewpoints: "From Perspective A..." and "From Perspective B..."',
-                '- For broad/decision queries, conclusions must be supported by multiple sources when available; do not rely on one dominant document.',
-                '- Build an internal mental model before final answer:',
-                '  1) entities and concepts',
-                '  2) relationship graph',
-                '  3) constraints and assumptions',
-                '  4) missing information / uncertainty',
                 '- Every factual sentence must include citation format exactly:',
                 '  [Source: filename, page X, "brief relevant quote"]',
-                '- Include a final section titled: "Uncertainties & Missing Information".',
+                '- Include uncertainty and confidence in natural language when evidence is incomplete.',
                 '',
                 'COGNITION PRIORS:',
                 '- Toyota Frontier Research (human-like event understanding): https://global.toyota/en/mobility/frontier-research/43225436.html',
@@ -2125,20 +1986,9 @@ ${evidenceDigest}`
                     'REPAIR REQUIREMENTS:',
                     '1) Keep answer fully source-grounded.',
                     '2) Ensure claim-level citations across factual statements.',
-                    '3) Include these sections:',
-                    '   - Executive Summary (Decision first, Reasoning Path, Actionable Steps)',
-                    '   - Predictive Model',
-                    '   - Prediction Errors, Tension Detection & Resolution',
-                    '   - Contextual Hierarchy',
-                    '   - Mental Model',
-                    '   - Human Cognitive Processing Loop (evidence intake, attention filtering, perception/interpretation, System1/System2 reasoning, decision/action, feedback loop, bias check)',
-                    '   - Analytical Framework',
-                    '   - Explicitly Stated Facts',
-                    '   - Inferred Implications',
-                    '   - Evidence-Based Expert Analysis',
-                    '   - Uncertainties & Missing Information',
-                    '4) Do not summarize only; provide reasoning, trade-offs, perspective analysis, and recommendation when appropriate.',
-                    '5) Include adversarial sentence with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
+                    '3) Communicate naturally: answer first, then integrated evidence-based rationale, then uncertainty/confidence.',
+                    '4) Do not summarize only; provide reasoning, trade-offs, and recommendation when appropriate.',
+                    '5) Include at least one contradictory/limiting evidence point with citation before final conclusion.',
                     '6) Avoid list-style narration like "Doc A says...". Integrate multiple evidence points per conclusion sentence.',
                     '7) Use prior chat memory only for continuity, never as factual evidence.',
                     '8) Normalize all citations to exact format [Source: filename, page X, "brief relevant quote"].',
