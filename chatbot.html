@@ -1471,7 +1471,7 @@
             const wordCount = q.split(/\s+/).filter(Boolean).length;
             const compoundQuestion = /[;?]/.test(q) || /\b(and|also|plus|along with|in addition)\b/.test(q);
             return {
-                broadCoverage: /\b(whole|entire|full|overall|comprehensive|big picture|summari[sz]e|main themes|analyze.*document|review.*document)\b/.test(q) || wordCount >= 18 || compoundQuestion,
+                broadCoverage: /\b(whole|entire|full|overall|comprehensive|big picture|summari[sz]e|main themes|analyze.*document|review.*document)\b/.test(q) || (wordCount >= 26 && compoundQuestion),
                 comparative: /\b(compare|contrast|versus|vs\.?)\b/.test(q),
                 extraction: /\b(list|extract|enumerate|all instances|find all)\b/.test(q),
                 timeline: /\b(timeline|chronological|over time|sequence)\b/.test(q)
@@ -1652,10 +1652,13 @@
 
         buildGlobalCoverageCandidates(scoredChunks, count) {
             if (count <= 0 || !Array.isArray(scoredChunks) || scoredChunks.length === 0) return [];
+            const topScore = Number(scoredChunks[0]?.score || 0);
+            const minScoreThreshold = topScore > 0 ? Math.max(0.08, topScore * 0.22) : 0.08;
             const bestByDocument = new Map();
             for (const chunk of scoredChunks) {
                 const docName = String(chunk?.filename || '');
                 if (!docName || bestByDocument.has(docName)) continue;
+                if (Number(chunk?.score || 0) < minScoreThreshold) continue;
                 bestByDocument.set(docName, chunk);
             }
             return Array.from(bestByDocument.values())
@@ -1730,7 +1733,7 @@
                 const coverage = this.buildCoverageCandidates(primaryResults, scoredChunks, Math.ceil(topK * 0.5));
                 primaryResults = this.mergeUniqueChunks(primaryResults, coverage, candidatePoolLimit);
             }
-            const shouldForceGlobalCoverage = intent.broadCoverage || intent.comparative || intent.extraction || intent.timeline || corpusSize >= 220;
+            const shouldForceGlobalCoverage = intent.broadCoverage || intent.comparative || intent.extraction || intent.timeline;
             if (shouldForceGlobalCoverage) {
                 const globalCoverageTarget = Math.min(
                     Math.ceil(topK * 0.9),
