@@ -421,14 +421,14 @@
                     pushHypothesis('tradeoff', 'Competing factors likely require weighing trade-offs rather than applying a single rule.', 0.66);
                 }
                 if (/\b(late|deadline|exception|override|appeal|special case)\b/i.test(raw)) {
-                    pushHypothesis('exception', 'General policy likely has context-specific exception clauses that may supersede default restrictions.', 0.72);
+                    pushHypothesis('exception', 'General baseline guidance may have context-specific exception clauses that supersede default restrictions.', 0.72);
                 }
-                if (/\b(policy|manual|guideline|rule|regulation|procedure)\b/i.test(raw)) {
-                    pushHypothesis('hierarchy', 'When sources conflict, more specific/authoritative policy text should outweigh generic guidance.', 0.76);
+                if (/\b(manual|guideline|rule|regulation|procedure|official)\b/i.test(raw)) {
+                    pushHypothesis('hierarchy', 'When sources conflict, more specific and authoritative source text should outweigh generic guidance.', 0.76);
                 }
 
                 const weightingPriors = {
-                    authority: 'Prefer official, policy-grade, and source-of-record documents over summaries.',
+                    authority: 'Prefer official source-of-record documents over summaries.',
                     recency: 'Prefer newer versions where temporal conflict exists.',
                     contextualRelevance: 'Prefer clauses that match the exact scenario and constraints from the query.'
                 };
@@ -975,12 +975,12 @@ ${evidenceDigest}`
                 sources = [],
                 instructionProfile = {}
             ) {
-                const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
+                const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                 if (!perspectiveMode) return '';
 
                 const candidates = [
                     { name: 'Operations', regex: /\b(operation|process|workflow|timeline|resource|capacity|implementation)\b/i },
-                    { name: 'Risk/Compliance', regex: /\b(risk|compliance|regulation|legal|safety|policy|governance)\b/i },
+                    { name: 'Risk/Compliance', regex: /\b(risk|compliance|regulation|legal|safety|governance)\b/i },
                     { name: 'Financial', regex: /\b(cost|budget|expense|roi|price|funding|financial)\b/i },
                     { name: 'User/Stakeholder', regex: /\b(user|customer|student|patient|employee|stakeholder|experience)\b/i }
                 ];
@@ -1035,7 +1035,7 @@ ${evidenceDigest}`
                 const text = String(source?.text || '');
                 const textLower = safeLower(text);
                 let authority = 0.45;
-                if (/\b(policy|manual|regulation|official|handbook|governance|guideline|o?fr)\b/.test(filename)) authority = 0.9;
+                if (/\b(manual|regulation|official|handbook|governance|guideline|o?fr|source[-_ ]of[-_ ]record)\b/.test(filename)) authority = 0.9;
                 else if (/\b(procedure|protocol|standard|framework)\b/.test(filename)) authority = 0.78;
                 else if (/\b(faq|summary|notes|announcement|memo|blog)\b/.test(filename)) authority = 0.56;
 
@@ -1223,7 +1223,7 @@ ${evidenceDigest}`
                 const hasCitationPrecision = diagnostics ? (diagnostics.citationPrecision || 0) >= Math.max(0.45, precisionTarget - 0.03) : true;
                 const crossSourceExpected = broadOrDecision && sourceDocCount >= MIN_CROSS_SOURCE_DOCS;
                 const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
-                const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
+                const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                 const adversarialMode = !!instructionProfile?.adversarialMode || broadOrDecision;
                 const perspectiveMentions = (text.match(/\bfrom perspective\s+[a-z0-9]/gi) || []).length + (text.match(/\b(stakeholder|team|user|operations|finance|compliance)\b/gi) || []).length;
                 const hasPerspectiveEvidence = perspectiveMentions >= 2;
@@ -1331,7 +1331,7 @@ ${evidenceDigest}`
                     `Question: ${query}`,
                     'Rewrite as natural human expert communication (not a forced heading template).',
                     '',
-                    'Communication policy:',
+                    'Communication rules:',
                     '- Begin with a direct answer in plain language.',
                     '- Explain reasoning as an integrated narrative that combines supporting and conflicting evidence.',
                     '- Separate observed facts from inferred implications in prose (do not invent facts).',
@@ -1762,10 +1762,10 @@ ${evidenceDigest}`
 
         patchMethod(CognitiveSynthesizer, 'buildInstructionProfile', (original) => function patchedBuildInstructionProfile(query) {
             const profile = original.call(this, query);
-            const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle|policy approach)\b/i.test(String(query || ''));
-            const perspectiveMode = /\b(stakeholder|policy|should we|implement|impact on|conflict|conflicting goals|audience|department|team|user group)\b/i.test(String(query || ''));
+            const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle)\b/i.test(String(query || ''));
+            const perspectiveMode = /\b(stakeholder|should we|implement|impact on|conflict|conflicting goals|audience|department|team|user group)\b/i.test(String(query || ''));
             const frameworkMode = /\b(framework|pros|cons|analysis|evaluate|assess|compare|trade-?off|root cause|causal|swot|strength|weakness)\b/i.test(String(query || '')) || decisionMode;
-            const adversarialMode = /\b(decision|recommend|policy|should|trade-?off|compare|risk|exception|counter)\b/i.test(String(query || '')) || decisionMode;
+            const adversarialMode = /\b(decision|recommend|should|trade-?off|compare|risk|exception|counter)\b/i.test(String(query || '')) || decisionMode;
             return {
                 ...profile,
                 strictSourceOnly: true,

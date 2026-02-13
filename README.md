@@ -1,12 +1,13 @@
 # chatgbt
-# Super-Brain Strict RAG Upgrade (Patch Layer)
+# Universal Strict RAG Cognitive Synthesis Engine
 
 This repository now contains:
 
-- `chatbot.html` (full single-file chatbot HTML with inline strict RAG enhancer)
+- `chatbot.html` (full single-file universal strict RAG engine)
 - `super_brain_rag_patch.js` (optional external drop-in patch file)
 
-`chatbot.html` is now fully self-contained; it does not require external patch loading.
+`chatbot.html` is fully self-contained; it does not require external patch loading.
+The optional inline "super-brain enhancer" is now **opt-in** (disabled by default) to prioritize stable, grounded behavior.
 
 ---
 
@@ -90,7 +91,7 @@ This repository now contains:
   - Explicitly Stated Facts
   - Inferred Implications
   - Perspective Analysis (when stakeholder conflicts are relevant)
-- Adds perspective-taking evidence maps to simulate multi-stakeholder viewpoints in policy/decision questions.
+- Adds perspective-taking evidence maps to simulate multi-stakeholder viewpoints in complex decision questions.
 
 ---
 
@@ -103,6 +104,7 @@ The current implementation hard-wires previously fragile features:
   - response caching (TTL + bounded size),
   - fallback model chain on transient API failures,
   - telemetry for cache hits and fallback usage.
+- Source-grounding is always strict in the core path (factual claims must be backed by provided sources).
 - Chat restore/render path now escapes user/system content before HTML injection points to prevent stored HTML/script injection.
 - Continuity memory is now applied only for explicit follow-up queries; standalone questions no longer inject prior chat turns by default.
 - Stop-word token sets are reused instead of recreated per call in hot paths.
@@ -123,7 +125,7 @@ What changed:
   - decision trade-off quality,
   instead of requiring fixed section titles.
 - Repair rewrites now request **natural expert communication** (answer first, rationale, limits), not mandatory scaffold blocks.
-- Prompt policy now asks the model to run an internal cognitive loop:
+- Prompt guidance now asks the model to run an internal cognitive loop:
   - recognize the decision/problem,
   - gather and filter relevant evidence,
   - evaluate options and conflicts,

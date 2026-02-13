@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>UofT Cognitive Synthesis Engine - Super-Brain Strict RAG</title>
+    <title>Cognitive Synthesis Engine - Universal Strict RAG</title>
     <style>
         :root {
             --primary: #002A5C;
@@ -579,7 +579,7 @@
 </head>
 <body>
     <header class="header">
-        <h1>UofT Cognitive Synthesis Engine</h1>
+        <h1>Cognitive Synthesis Engine</h1>
         <div style="display:flex;align-items:center;gap:.75rem;">
             <span class="brain-badge">Brain-Aligned Strict RAG</span>
             <button class="header-btn" id="openAdminBtn" title="Open Admin Panel (Ctrl+Shift+A)">Admin Panel</button>
@@ -735,6 +735,8 @@
     const RESPONSE_CACHE_TTL_MS = 1000 * 60 * 30;
     const COMPLETION_TELEMETRY_KEY = 'completion_telemetry_v1';
     const MODEL_FALLBACK_ORDER = ['gpt-4.1', 'gpt-4o', 'gpt-4o-mini'];
+    const INLINE_SUPER_BRAIN_ENHANCER_STORAGE_KEY = 'enable_inline_super_brain_enhancer';
+    const INLINE_SUPER_BRAIN_ENHANCER_DEFAULT = false;
     const RETRIEVER_STOP_WORDS = new Set([
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be',
@@ -1466,8 +1468,10 @@
 
         detectQueryIntent(query) {
             const q = query.toLowerCase();
+            const wordCount = q.split(/\s+/).filter(Boolean).length;
+            const compoundQuestion = /[;?]/.test(q) || /\b(and|also|plus|along with|in addition)\b/.test(q);
             return {
-                broadCoverage: /\b(whole|entire|full|overall|comprehensive|big picture|summari[sz]e|main themes|analyze.*document|review.*document)\b/.test(q),
+                broadCoverage: /\b(whole|entire|full|overall|comprehensive|big picture|summari[sz]e|main themes|analyze.*document|review.*document)\b/.test(q) || wordCount >= 18 || compoundQuestion,
                 comparative: /\b(compare|contrast|versus|vs\.?)\b/.test(q),
                 extraction: /\b(list|extract|enumerate|all instances|find all)\b/.test(q),
                 timeline: /\b(timeline|chronological|over time|sequence)\b/.test(q)
@@ -1646,6 +1650,19 @@
             return coverage.slice(0, count);
         }
 
+        buildGlobalCoverageCandidates(scoredChunks, count) {
+            if (count <= 0 || !Array.isArray(scoredChunks) || scoredChunks.length === 0) return [];
+            const bestByDocument = new Map();
+            for (const chunk of scoredChunks) {
+                const docName = String(chunk?.filename || '');
+                if (!docName || bestByDocument.has(docName)) continue;
+                bestByDocument.set(docName, chunk);
+            }
+            return Array.from(bestByDocument.values())
+                .sort((a, b) => (b.score || 0) - (a.score || 0))
+                .slice(0, count);
+        }
+
         findConceptLinkedChunks(primaryChunks, query, queryTokens, queryConcepts) {
             const linkedChunkIds = new Set();
             const linkedChunks = [];
@@ -1673,11 +1690,11 @@
             const intent = options.intent || this.detectQueryIntent(query);
             const corpusSize = this.allChunks.length;
             if (topK === null) {
-                if (intent.broadCoverage) topK = corpusSize <= 60 ? 18 : corpusSize <= 200 ? 24 : Math.min(32, Math.ceil(corpusSize * 0.08));
+                if (intent.broadCoverage) topK = corpusSize <= 60 ? 20 : corpusSize <= 200 ? 28 : Math.min(40, Math.ceil(corpusSize * 0.1));
                 else if (corpusSize <= 50) topK = 10;
                 else if (corpusSize <= 200) topK = 15;
                 else if (corpusSize <= 500) topK = 20;
-                else topK = Math.min(25, Math.ceil(corpusSize * 0.05));
+                else topK = Math.min(36, Math.ceil(corpusSize * 0.06));
             }
 
             const queryVariants = this.generateQueryVariants(query, intent);
@@ -1706,16 +1723,26 @@
                 return { ...chunk, score };
             }).sort((a, b) => b.score - a.score);
 
+            const candidatePoolLimit = Math.max(topK, Math.ceil(topK * 1.8));
             let primaryResults = this.diversifyResults(scoredChunks, Math.ceil(topK * 0.7));
             const bestScore = primaryResults[0]?.score || 0;
             if (intent.broadCoverage || bestScore < RETRIEVAL_LOW_SCORE_THRESHOLD) {
                 const coverage = this.buildCoverageCandidates(primaryResults, scoredChunks, Math.ceil(topK * 0.5));
-                primaryResults = this.mergeUniqueChunks(primaryResults, coverage, topK);
+                primaryResults = this.mergeUniqueChunks(primaryResults, coverage, candidatePoolLimit);
+            }
+            const shouldForceGlobalCoverage = intent.broadCoverage || intent.comparative || intent.extraction || intent.timeline || corpusSize >= 220;
+            if (shouldForceGlobalCoverage) {
+                const globalCoverageTarget = Math.min(
+                    Math.ceil(topK * 0.9),
+                    Math.max(6, Math.ceil((this.documents?.length || 0) * 0.35))
+                );
+                const globalCoverage = this.buildGlobalCoverageCandidates(scoredChunks, globalCoverageTarget);
+                primaryResults = this.mergeUniqueChunks(primaryResults, globalCoverage, candidatePoolLimit);
             }
             const baseFeatures = variantFeatures[0];
             const linkedChunks = this.findConceptLinkedChunks(primaryResults, query, baseFeatures.queryTokens, baseFeatures.queryConcepts)
                 .slice(0, Math.max(2, Math.floor(topK * 0.25)));
-            const merged = this.mergeUniqueChunks(primaryResults, linkedChunks, topK);
+            const merged = this.mergeUniqueChunks(primaryResults, linkedChunks, candidatePoolLimit);
             if (merged.length === 0) return this.allChunks.slice(0, topK);
 
             const rerankCandidates = this.mergeUniqueChunks(
@@ -1732,7 +1759,7 @@
                     return this.mergeUniqueChunks(lexicalHead, semanticHead, topK);
                 }
             }
-            return merged;
+            return merged.slice(0, topK);
         }
 
         calculateLocalRelevanceScore(chunk, queryTokens, queryEntities, queryConcepts) {
@@ -2075,7 +2102,7 @@
                     'structured prose',
                 wantsSteps: /\b(step[- ]by[- ]step|steps)\b/.test(lower),
                 wordLimit: wordLimitMatch ? parseInt(wordLimitMatch[1], 10) : null,
-                strictSourceOnly: /\b(only use|based only|strictly from|from provided|from uploaded)\b/.test(lower),
+                strictSourceOnly: true,
                 userIntent: lower
             };
         }
@@ -2083,9 +2110,9 @@
         shouldUseContinuityMemory(query = '') {
             const value = String(query || '').trim();
             if (!value) return false;
-            const isShort = value.split(/\s+/).filter(Boolean).length <= 14;
-            const hasFollowUpCue = /\b(this|that|these|those|it|they|them|above|previous|earlier|prior|last answer|as mentioned|same (?:policy|document|topic)|continue|follow[- ]?up)\b/i.test(value);
-            return hasFollowUpCue || isShort;
+            const hasFollowUpCue = /\b(this|that|these|those|it|they|them|above|previous|earlier|prior|last answer|as mentioned|same (?:document|topic)|continue|follow[- ]?up|what about|how about|expand|elaborate|clarify)\b/i.test(value);
+            const startsAsContinuation = /^(and|also|plus|then|what about|how about)\b/i.test(value.toLowerCase());
+            return hasFollowUpCue || startsAsContinuation;
         }
 
         getWorkingMemorySummary(query = '') {
@@ -2754,7 +2781,7 @@ ${answer}`
             const formatReq = instructionProfile.requestedFormat || 'structured prose';
             const stepReq = instructionProfile.wantsSteps ? 'Yes' : 'No';
             const wordLimit = instructionProfile.wordLimit ? `${instructionProfile.wordLimit} words` : 'No explicit limit';
-            const sourceOnly = instructionProfile.strictSourceOnly ? 'Yes - strictly source-grounded.' : 'Ground all factual claims in provided sources.';
+            const sourceOnly = 'Strictly source-grounded; do not use outside knowledge for factual claims.';
             return `You are a COGNITIVE SYNTHESIS ENGINE.
 
 You are given:
@@ -2766,6 +2793,7 @@ IMPORTANT ACCESS RULE:
 - If context is provided, NEVER claim you cannot access the documents.
 - Never mention "training cutoff" unless user explicitly asks about model knowledge limits.
 - If evidence is missing, say: "Based on the available documents, I cannot fully confirm..."
+- Do not use external/world knowledge as factual evidence. Only provided sources are authoritative.
 
 Human-like synthesis mode (inspired by brain-mimicking LLM research):
 - Working-memory loop: obey the current instruction contract precisely.
@@ -2783,7 +2811,7 @@ Instruction contract:
 - Output format: ${formatReq}
 - Step-by-step required: ${stepReq}
 - Length target: ${wordLimit}
-- Source policy: ${sourceOnly}
+- Source grounding: ${sourceOnly}
 
 MANDATORY CITATION FORMAT:
 [Source: filename, page X, "brief relevant quote"]
@@ -2856,7 +2884,8 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
                 `- Format: ${instructionProfile.requestedFormat}`,
                 `- Step-by-step: ${instructionProfile.wantsSteps ? 'yes' : 'no'}`,
                 `- Word limit: ${instructionProfile.wordLimit ? instructionProfile.wordLimit : 'no strict limit'}`,
-                `- Source-only strictness: ${instructionProfile.strictSourceOnly ? 'strict' : 'grounded, with clear uncertainty if missing'}`
+                '- Source-only strictness: strict (use only provided sources)',
+                '- If evidence is insufficient, state uncertainty clearly instead of guessing.'
             ];
             return lines.join('\n');
         }
@@ -4037,6 +4066,25 @@ ${attachmentEvidence.contextText}`);
     (function inlineSuperBrainEnhancer() {
         'use strict';
 
+        const enhancerStorageKey =
+            (typeof INLINE_SUPER_BRAIN_ENHANCER_STORAGE_KEY === 'string' && INLINE_SUPER_BRAIN_ENHANCER_STORAGE_KEY)
+                ? INLINE_SUPER_BRAIN_ENHANCER_STORAGE_KEY
+                : 'enable_inline_super_brain_enhancer';
+        const enhancerDefault =
+            (typeof INLINE_SUPER_BRAIN_ENHANCER_DEFAULT === 'boolean')
+                ? INLINE_SUPER_BRAIN_ENHANCER_DEFAULT
+                : false;
+
+        function isEnhancerEnabled() {
+            try {
+                const raw = localStorage.getItem(enhancerStorageKey);
+                if (raw === null) return enhancerDefault;
+                return ['1', 'true', 'yes', 'on'].includes(String(raw).trim().toLowerCase());
+            } catch {
+                return enhancerDefault;
+            }
+        }
+
         const PATCH_VERSION = '2026-02-11-inline-superbrain-v7';
         const FULL_SCAN_MIN_TOPK = 26;
         const FULL_SCAN_MAX_TOPK = 46;
@@ -4441,14 +4489,14 @@ ${attachmentEvidence.contextText}`);
                         pushHypothesis('tradeoff', 'Competing factors likely require weighing trade-offs rather than applying a single rule.', 0.66);
                     }
                     if (/\b(late|deadline|exception|override|appeal|special case)\b/i.test(raw)) {
-                        pushHypothesis('exception', 'General policy likely has context-specific exception clauses that may supersede default restrictions.', 0.72);
+                        pushHypothesis('exception', 'General baseline guidance may have context-specific exception clauses that supersede default restrictions.', 0.72);
                     }
-                    if (/\b(policy|manual|guideline|rule|regulation|procedure)\b/i.test(raw)) {
-                        pushHypothesis('hierarchy', 'When sources conflict, more specific/authoritative policy text should outweigh generic guidance.', 0.76);
+                    if (/\b(manual|guideline|rule|regulation|procedure|official)\b/i.test(raw)) {
+                        pushHypothesis('hierarchy', 'When sources conflict, more specific and authoritative source text should outweigh generic guidance.', 0.76);
                     }
 
                     const weightingPriors = {
-                        authority: 'Prefer official, policy-grade, and source-of-record documents over summaries.',
+                        authority: 'Prefer official source-of-record documents over summaries.',
                         recency: 'Prefer newer versions where temporal conflict exists.',
                         contextualRelevance: 'Prefer clauses that match the exact scenario and constraints from the query.'
                     };
@@ -4912,7 +4960,7 @@ ${attachmentEvidence.contextText}`);
                     const options = optionSignals.length >= 2
                         ? optionSignals.map(item => item.statement).slice(0, 4)
                         : (instructionProfile?.decisionMode ? [
-                            'Conservative option: prioritize lower-risk, policy-aligned path.',
+                            'Conservative option: prioritize a lower-risk, evidence-constrained path.',
                             'Aggressive option: prioritize speed/impact with higher execution risk.'
                         ] : []);
                     const uncertaintySignals = uniqueBy(
@@ -4987,7 +5035,7 @@ ${attachmentEvidence.contextText}`);
                         ...((state.uncertaintyModel?.openQuestions || []).slice(0, 5).map(item => `  - ${item}`) || ['  - N/A']),
                         '- Feedback loop:',
                         ...((state.feedbackModel?.loop || []).slice(0, 3).map(item => `  - ${item}`) || ['  - N/A']),
-                        '- Communication policy: respond like a human expert in natural prose unless the user explicitly asks for a rigid format.'
+                        '- Communication rules: respond like a human expert in natural prose unless the user explicitly asks for a rigid format.'
                     ];
                     return lines.join('\n');
                 };
@@ -5121,12 +5169,12 @@ ${attachmentEvidence.contextText}`);
                     sources = [],
                     instructionProfile = {}
                 ) {
-                    const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
+                    const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                     if (!perspectiveMode) return '';
 
                     const candidates = [
                         { name: 'Operations', regex: /\b(operation|process|workflow|timeline|resource|capacity|implementation)\b/i },
-                        { name: 'Risk/Compliance', regex: /\b(risk|compliance|regulation|legal|safety|policy|governance)\b/i },
+                        { name: 'Risk/Compliance', regex: /\b(risk|compliance|regulation|legal|safety|governance)\b/i },
                         { name: 'Financial', regex: /\b(cost|budget|expense|roi|price|funding|financial)\b/i },
                         { name: 'User/Stakeholder', regex: /\b(user|customer|student|patient|employee|stakeholder|experience)\b/i }
                     ];
@@ -5181,7 +5229,7 @@ ${attachmentEvidence.contextText}`);
                     const text = String(source?.text || '');
                     const textLower = text.toLowerCase();
                     let authority = 0.45;
-                    if (/\b(policy|manual|regulation|official|handbook|governance|guideline|o?fr)\b/.test(filename)) authority = 0.9;
+                    if (/\b(manual|regulation|official|handbook|governance|guideline|o?fr|source[-_ ]of[-_ ]record)\b/.test(filename)) authority = 0.9;
                     else if (/\b(procedure|protocol|standard|framework)\b/.test(filename)) authority = 0.78;
                     else if (/\b(faq|summary|notes|announcement|memo|blog)\b/.test(filename)) authority = 0.56;
 
@@ -5311,7 +5359,7 @@ ${attachmentEvidence.contextText}`);
 
                     const restrictiveRegex = /\b(must|required|shall|cannot|can't|prohibited|not allowed|only|ineligible|restricted)\b/i;
                     const permissiveRegex = /\b(may|can|allowed|eligible|unless|either|or|option)\b/i;
-                    const policyLikeRegex = /\b(policy|enrol|enroll|require|limit|program|course|admission|completion|eligible|ineligible)\b/i;
+                    const highSignalStatementRegex = /\b(must|required|require|limit|allowed|prohibited|eligib|ineligib|condition|exception|override)\b/i;
 
                     const restrictive = [];
                     const permissive = [];
@@ -5323,7 +5371,7 @@ ${attachmentEvidence.contextText}`);
                         for (const sentenceRaw of sentences) {
                             const sentence = sentenceRaw.replace(/\s+/g, ' ').trim();
                             if (sentence.length < 40 || sentence.length > 330) continue;
-                            if (!policyLikeRegex.test(sentence)) continue;
+                            if (!highSignalStatementRegex.test(sentence)) continue;
                             const tokens = this.superBrainTokenize(sentence).slice(0, 28);
                             if (tokens.length < 5) continue;
                             const item = {
@@ -5337,7 +5385,7 @@ ${attachmentEvidence.contextText}`);
                         }
                     }
 
-                    if (!restrictive.length || !permissive.length) return '## CONTRADICTION CHECK\n- No high-signal policy contradictions detected in sampled evidence.';
+                    if (!restrictive.length || !permissive.length) return '## CONTRADICTION CHECK\n- No high-signal contradictions detected in sampled evidence.';
 
                     const pairs = [];
                     const restrictHead = restrictive.slice(0, 90);
@@ -5363,7 +5411,7 @@ ${attachmentEvidence.contextText}`);
                         if (unique.length >= maxPairs) break;
                     }
 
-                    if (!unique.length) return '## CONTRADICTION CHECK\n- No high-signal policy contradictions detected in sampled evidence.';
+                    if (!unique.length) return '## CONTRADICTION CHECK\n- No high-signal contradictions detected in sampled evidence.';
 
                     const lines = ['## CONTRADICTION CHECK (CROSS-SOURCE TENSION TEST)'];
                     for (let i = 0; i < unique.length; i++) {
@@ -5464,7 +5512,7 @@ ${attachmentEvidence.contextText}`);
                     const hasCitationPrecision = diagnostics ? (diagnostics.citationPrecision || 0) >= Math.max(0.45, CITATION_PRECISION_TARGET - 0.03) : true;
                     const crossSourceExpected = broadOrDecision && sourceDocCount >= MIN_CROSS_SOURCE_DOCS;
                     const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
-                    const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
+                    const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                     const adversarialMode = !!instructionProfile?.adversarialMode || broadOrDecision;
                     const perspectiveMentions = (text.match(/\bfrom perspective\s+[a-z0-9]/gi) || []).length + (text.match(/\b(stakeholder|team|user|operations|finance|compliance)\b/gi) || []).length;
                     const hasPerspectiveEvidence = perspectiveMentions >= 2;
@@ -5575,7 +5623,7 @@ ${attachmentEvidence.contextText}`);
                         `Question: ${query}`,
                         'Rewrite as natural human expert communication (not a forced heading template).',
                         '',
-                        'Communication policy:',
+                        'Communication rules:',
                         '- Begin with a direct answer in plain language.',
                         '- Explain reasoning as an integrated narrative that combines supporting and conflicting evidence.',
                         '- Separate observed facts from inferred implications in prose (do not invent facts).',
@@ -5974,10 +6022,10 @@ ${attachmentEvidence.contextText}`);
 
             patchMethod(CognitiveSynthesizer, 'buildInstructionProfile', (original) => function patchedBuildInstructionProfile(query) {
                 const profile = original.call(this, query);
-                const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle|policy approach)\b/i.test(String(query || ''));
-                const perspectiveMode = /\b(stakeholder|policy|should we|implement|impact on|conflict|conflicting goals|audience|department|team|user group)\b/i.test(String(query || ''));
+                const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle)\b/i.test(String(query || ''));
+                const perspectiveMode = /\b(stakeholder|should we|implement|impact on|conflict|conflicting goals|audience|department|team|user group)\b/i.test(String(query || ''));
                 const frameworkMode = /\b(framework|pros|cons|analysis|evaluate|assess|compare|trade-?off|root cause|causal|swot|strength|weakness)\b/i.test(String(query || '')) || decisionMode;
-                const adversarialMode = /\b(decision|recommend|policy|should|trade-?off|compare|risk|exception|counter)\b/i.test(String(query || '')) || decisionMode;
+                const adversarialMode = /\b(decision|recommend|should|trade-?off|compare|risk|exception|counter)\b/i.test(String(query || '')) || decisionMode;
                 return {
                     ...profile,
                     strictSourceOnly: true,
@@ -6363,6 +6411,12 @@ ${attachmentEvidence.contextText}`);
         }
 
         function boot(attempt = 0) {
+            if (!isEnhancerEnabled()) {
+                try {
+                    console.info(`[Inline Super-Brain Enhancer] disabled by default. Set localStorage["${enhancerStorageKey}"]="1" to opt in.`);
+                } catch {}
+                return;
+            }
             const ok = tryInstall();
             if (ok) return;
             if (attempt > 120) {
