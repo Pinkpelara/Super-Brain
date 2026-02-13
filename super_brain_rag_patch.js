@@ -17,7 +17,7 @@
 (function superBrainRagPatch() {
     'use strict';
 
-    const PATCH_VERSION = '2026.02.11-superbrain-v4';
+    const PATCH_VERSION = '2026.02.11-superbrain-v5';
     const FULL_SWEEP_MIN_ANCHORS_PER_DOC = 2;
     const DEFAULT_TARGET_K_SMALL = 22;
     const DEFAULT_TARGET_K_MEDIUM = 30;
@@ -404,21 +404,21 @@
                 const pushHypothesis = (type, statement, confidence = 0.5) => {
                     const cleaned = String(statement || '').replace(/\s+/g, ' ').trim();
                     if (!cleaned) return;
-                    hypotheses.push({ type, statement: cleaned, confidence });
+                    hypotheses.push({ type, statement: cleaned, confidence, nonFactualPrior: true });
                 };
 
-                pushHypothesis('baseline_rule', `Primary rule likely governs: ${raw}`, 0.58);
+                pushHypothesis('baseline_rule', `Test hypothesis: identify the governing baseline rule(s) for "${raw}".`, 0.58);
                 if (graph.constraints?.length) {
-                    pushHypothesis('constraint', `Constraints likely narrow options: ${graph.constraints.slice(0, 2).join('; ')}`, 0.63);
+                    pushHypothesis('constraint', `Test hypothesis: constraints materially narrow feasible options (${graph.constraints.slice(0, 2).join('; ')}).`, 0.63);
                 }
                 if (graph.relations?.length || intent.comparative) {
-                    pushHypothesis('tradeoff', 'Competing factors likely require weighing trade-offs rather than applying a single rule.', 0.66);
+                    pushHypothesis('tradeoff', 'Test hypothesis: competing factors require explicit trade-off analysis instead of one-rule resolution.', 0.66);
                 }
                 if (/\b(late|deadline|exception|override|appeal|special case)\b/i.test(raw)) {
-                    pushHypothesis('exception', 'General policy likely has context-specific exception clauses that may supersede default restrictions.', 0.72);
+                    pushHypothesis('exception', 'Test hypothesis: exception/override clauses may exist and must be verified directly in source text.', 0.72);
                 }
                 if (/\b(policy|manual|guideline|rule|regulation|procedure)\b/i.test(raw)) {
-                    pushHypothesis('hierarchy', 'When sources conflict, more specific/authoritative policy text should outweigh generic guidance.', 0.76);
+                    pushHypothesis('hierarchy', 'Test hypothesis: precedence may be resolved by explicit hierarchy language (specificity/authority/recency) if citations confirm it.', 0.76);
                 }
 
                 const weightingPriors = {
@@ -427,8 +427,8 @@
                     contextualRelevance: 'Prefer clauses that match the exact scenario and constraints from the query.'
                 };
                 const anticipatedConclusion = hypotheses.length
-                    ? hypotheses.slice(0, 2).map(item => item.statement).join(' ')
-                    : `Likely requires balancing baseline rules against scenario-specific exceptions for: ${raw}`;
+                    ? `Provisional non-factual prior for retrieval planning: ${hypotheses.slice(0, 2).map(item => item.statement).join(' ')}`
+                    : `Provisional non-factual prior for retrieval planning only; no conclusion until evidence is cited for: ${raw}`;
 
                 return {
                     query: raw,
@@ -948,12 +948,13 @@ ${evidenceDigest}`
                 const adversarialChunks = Array.isArray(adversarialState?.chunks)
                     ? adversarialState.chunks
                     : (Array.isArray(adversarialState) ? adversarialState : []);
-                if (!adversarialChunks.length) return '';
+                const passes = Number(adversarialState?.passes || 0);
+                if (!adversarialChunks.length || passes <= 0) return '';
                 const queryTokens = this.superBrainTokenize(query);
                 const lines = [
                     '## ADVERSARIAL RETRIEVAL (DEVIL\'S ADVOCATE)',
                     '- Secondary retrieval pass explicitly searched for disconfirming evidence, exceptions, and limitations.',
-                    `- Adversarial retrieval passes: ${adversarialState?.passes || 1}`
+                    `- Adversarial retrieval passes: ${passes}`
                 ];
                 let added = 0;
                 for (const chunk of adversarialChunks.slice(0, Math.max(3, maxItems))) {
@@ -964,7 +965,7 @@ ${evidenceDigest}`
                     added += 1;
                     if (added >= maxItems) break;
                 }
-                lines.push('- Required final-answer line: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                lines.push('- Include contradiction sentence only if disconfirming evidence is explicitly cited.');
                 return lines.join('\n');
             };
         }
@@ -1084,7 +1085,8 @@ ${evidenceDigest}`
 
                 const lines = [
                     '## Predictive Model (Pre-Evidence Expectation)',
-                    `- Anticipated conclusion: ${predictiveModel.anticipatedConclusion || 'N/A'}`,
+                    '- Predictive hypothesis status: provisional non-factual prior used only to guide retrieval.',
+                    `- Anticipated hypothesis set (not factual claims): ${predictiveModel.anticipatedConclusion || 'N/A'}`,
                     '- Hypotheses:'
                 ];
                 if (hypotheses.length) {
@@ -1105,7 +1107,7 @@ ${evidenceDigest}`
                 } else {
                     lines.push('- No major prediction errors detected in current evidence sample.');
                 }
-                lines.push('- Tension resolution rule: when baseline and exception conflict, apply contextual hierarchy (specific authoritative clause + scenario match + recency) to determine which evidence wins.');
+                lines.push('- Tension resolution rule: when baseline and exception conflict, only resolve with directly cited precedence/exception language from sources.');
                 return lines.join('\n');
             };
         }
@@ -1124,21 +1126,39 @@ ${evidenceDigest}`
                 }).sort((a, b) => b.weighted - a.weighted);
                 const winner = ranked[0];
                 const challenger = ranked[1];
+                const precedenceRegex = /\b(takes precedence|shall prevail|prevails over|overrides?|supersedes?|in case of conflict|except as provided|subject to)\b/i;
+                const precedenceEvidence = ranked
+                    .map(item => {
+                        const sentence = this.superBrainBestSentence(item.source?.text || '', queryTokens).replace(/\s+/g, ' ').trim();
+                        if (!sentence || !precedenceRegex.test(sentence)) return null;
+                        return { item, sentence };
+                    })
+                    .filter(Boolean)
+                    .slice(0, 2);
 
                 const lines = ['## Contextual Hierarchy (Evidence Weighting)'];
                 lines.push('- Weighting dimensions: Authority (42%), Recency (24%), Contextual Relevance (34%).');
+                lines.push('- Important: weighting is retrieval triage only; final precedence claims require explicit cited precedence language.');
                 lines.push('- Top weighted evidence:');
                 for (const item of ranked.slice(0, 4)) {
                     lines.push(`- ${item.source.filename || 'Unknown'} -> score ${item.weighted.toFixed(2)} (authority ${item.authority.toFixed(2)}, recency ${item.recency.toFixed(2)}, relevance ${item.relevance.toFixed(2)})`);
                 }
-                if (winner) {
+                if (winner && precedenceEvidence.length) {
                     const sentence = this.superBrainBestSentence(winner.source.text || '', queryTokens).replace(/\s+/g, ' ').trim();
                     const quote = sentence.slice(0, 110).replace(/"/g, '\'');
                     lines.push(`- Winning context source: ${winner.source.filename || 'Unknown'} [Source: ${winner.source.filename || 'Unknown'}, page ${winner.source.page || 'N/A'}, "${quote || 'relevant quote'}"]`);
                 }
-                if (winner && challenger) {
+                if (precedenceEvidence.length) {
+                    for (const entry of precedenceEvidence) {
+                        const quote = entry.sentence.slice(0, 110).replace(/"/g, '\'');
+                        lines.push(`- Explicit precedence clause: ${entry.sentence.slice(0, 220)} [Source: ${entry.item.source.filename || 'Unknown'}, page ${entry.item.source.page || 'N/A'}, "${quote || 'relevant quote'}"]`);
+                    }
+                } else {
+                    lines.push('- No explicit precedence clause found in current evidence. Do NOT claim a definitive policy winner; request additional governing documents if needed.');
+                }
+                if (winner && challenger && precedenceEvidence.length) {
                     const why = winner.weighted >= challenger.weighted
-                        ? `Evidence from ${winner.source.filename || 'top source'} wins over ${challenger.source.filename || 'secondary source'} due to higher weighted hierarchy score and better scenario fit.`
+                        ? `Evidence from ${winner.source.filename || 'top source'} is preferred because explicit precedence language is present and context match is stronger.`
                         : 'Evidence tension remains unresolved; additional authoritative material is required.';
                     lines.push(`- Conflict resolution: ${why}`);
                 }
@@ -1217,6 +1237,7 @@ ${evidenceDigest}`
                 const hasReasoningPathSection = /(^|\n)\s*#{1,3}\s*reasoning path\b/i.test(text) || /\breasoning path\s*:/i.test(lower);
                 const hasActionableStepsSection = /(^|\n)\s*#{1,3}\s*actionable steps\b/i.test(text) || /(^|\n)\s*#{1,3}\s*next steps\b/i.test(text);
                 const hasPredictiveModelSection = /(^|\n)\s*#{1,3}\s*predictive model\b/i.test(text);
+                const hasPredictiveHypothesisDisclaimer = /predictive hypothesis status|provisional non-factual prior|not factual claims|hypothesis.*to test/i.test(lower);
                 const hasTensionResolutionSection = /(^|\n)\s*#{1,3}\s*(prediction errors?|tension detection|tension resolution)\b/i.test(text) || /\bprediction error\b/i.test(lower);
                 const hasContextHierarchySection = /(^|\n)\s*#{1,3}\s*contextual hierarchy\b/i.test(text) || /\bweighting dimensions\b/i.test(lower) || /\bauthority\b.*\brecency\b.*\brelevance\b/i.test(lower);
                 const listStyleDocNarration = /\b(doc(?:ument)?\s*[a-z0-9]+\s+says|doc(?:ument)?\s*[a-z0-9]+\s+states)\b/i.test(text);
@@ -1239,6 +1260,7 @@ ${evidenceDigest}`
                 const crossSourceSatisfied = !crossSourceExpected || citedDocs.length >= Math.min(MIN_CROSS_SOURCE_DOCS, sourceDocCount);
                 const perspectiveMode = !!instructionProfile?.perspectiveMode || /\b(stakeholder|policy|should we|implement|impact|conflict|trade-?off|goals?)\b/i.test(String(query || ''));
                 const adversarialMode = !!instructionProfile?.adversarialMode || broadOrDecision;
+                const adversarialEvidenceAvailable = Number(activationReport?.adversarialChunks || 0) > 0;
                 const perspectiveMentions = (text.match(/\bfrom perspective\s+[a-z0-9]/gi) || []).length;
                 const hasPerspectiveSection = /(^|\n)\s*#{1,3}\s*(perspective analysis|stakeholder perspectives?|multi-?perspective)\b/i.test(text) || perspectiveMentions >= 2;
                 const hasAdversarialLine = /while the primary evidence suggests/i.test(lower) &&
@@ -1297,6 +1319,7 @@ ${evidenceDigest}`
                 if (!hasReasoningPathSection) reasons.push('Missing explicit "Reasoning Path" section.');
                 if (!hasActionableStepsSection) reasons.push('Missing explicit actionable steps / next steps section.');
                 if (!hasPredictiveModelSection) reasons.push('Missing "Predictive Model" section.');
+                if (!hasPredictiveHypothesisDisclaimer) reasons.push('Predictive model must be labeled as a provisional hypothesis (not factual claim).');
                 if (!hasTensionResolutionSection) reasons.push('Missing prediction-error/tension-resolution section.');
                 if (!hasContextHierarchySection) reasons.push('Missing contextual hierarchy weighting (authority/recency/relevance) section.');
                 if (listStyleDocNarration) reasons.push('Response uses list-style document narration ("Doc A says..."), which violates synthesis rule.');
@@ -1311,7 +1334,7 @@ ${evidenceDigest}`
                 if (!hasCitationPrecision) reasons.push('Citation precision is below required threshold.');
                 if (!crossSourceSatisfied) reasons.push('Cross-source reasoning is weak (insufficient distinct cited documents).');
                 if (!cohesiveOrder) reasons.push('Output is not organized as a cohesive analyst brief (section order is inconsistent).');
-                if (adversarialMode && !hasAdversarialLine) reasons.push('Missing required adversarial statement ("While the primary evidence suggests X ... contradicts/modifies ...").');
+                if (adversarialMode && adversarialEvidenceAvailable && !hasAdversarialLine) reasons.push('Missing required adversarial statement ("While the primary evidence suggests X ... contradicts/modifies ...").');
                 if (perspectiveMode && !hasPerspectiveSection) reasons.push('Perspective-taking is missing (need at least two stakeholder viewpoints).');
                 if (stageSignalCount < minStageSignals) {
                     reasons.push(`Human cognitive cycle is incomplete (${stageSignalCount}/${minStageSignals} stage signals).`);
@@ -1351,6 +1374,7 @@ ${evidenceDigest}`
                     hasReasoningPathSection,
                     hasActionableStepsSection,
                     hasPredictiveModelSection,
+                    hasPredictiveHypothesisDisclaimer,
                     hasTensionResolutionSection,
                     hasContextHierarchySection,
                     listStyleDocNarration,
@@ -1362,6 +1386,7 @@ ${evidenceDigest}`
                     hasPerspectiveSection,
                     perspectiveMentions,
                     adversarialMode,
+                    adversarialEvidenceAvailable,
                     hasAdversarialLine,
                     cohesiveOrder,
                     crossSourceExpected,
@@ -1388,6 +1413,7 @@ ${evidenceDigest}`
                 const decisionMode = !!instructionProfile?.decisionMode;
                 const perspectiveMode = !!instructionProfile?.perspectiveMode;
                 const adversarialMode = !!instructionProfile?.adversarialMode || decisionMode;
+                const requireAdversarialLine = adversarialMode && !!depthGate?.adversarialEvidenceAvailable;
                 const minCitations = sourceDocCount >= 10 ? MIN_CITATIONS_FOR_RICH_CORPUS : (sourceDocCount >= 4 ? 2 : (sourceDocCount > 0 ? 1 : 0));
                 const lines = [
                     'ANALYSIS-DEPTH REWRITE GATE (MANDATORY)',
@@ -1409,6 +1435,7 @@ ${evidenceDigest}`
                     '## Inferred Implications',
                     '## Evidence-Based Expert Analysis'
                 ];
+                lines.push('- In "Predictive Model", explicitly label content as provisional hypothesis only (not factual claim).');
                 lines.push('- In "Human Cognitive Processing Loop", explicitly include:');
                 lines.push('  1) Evidence Intake (sensation proxy from retrieved documents)');
                 lines.push('  2) Attention Filtering (signal vs noise)');
@@ -1433,13 +1460,16 @@ ${evidenceDigest}`
                     lines.push('Decision rule: compare at least two concrete options with source-grounded trade-offs before recommending.');
                 }
                 lines.push('Coherence rule: keep section order exactly as scaffolded to produce one cohesive analyst brief (do not mix sections).');
+                lines.push('Predictive rule: mark predictive model content as provisional hypothesis only; never present it as fact without citation.');
                 lines.push('Framework rule: use one structured framework explicitly (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness).');
                 lines.push('Fact-vs-inference rule: every inference must be linked to cited explicit facts.');
                 if (perspectiveMode) {
                     lines.push('Perspective rule: include at least two viewpoints with "From Perspective A..." and "From Perspective B..." plus citations.');
                 }
-                if (adversarialMode) {
+                if (requireAdversarialLine) {
                     lines.push('Adversarial rule: include this exact pattern with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                } else if (adversarialMode) {
+                    lines.push('Adversarial rule: do not fabricate contradictions; include adversarial sentence only if disconfirming evidence is explicitly cited.');
                 }
                 const reasons = Array.isArray(depthGate?.reasons) ? depthGate.reasons.filter(Boolean) : [];
                 if (reasons.length) {
@@ -1861,7 +1891,7 @@ ${evidenceDigest}`
             const sections = [
                 'Mandatory cognitive scaffold for this answer:',
                 '1) Executive Summary (Decision first, then Reasoning Path, then Actionable Steps)',
-                '2) Predictive Model (pre-evidence expectation)',
+                '2) Predictive Model (provisional non-factual hypothesis to test)',
                 '3) Prediction Errors, Tension Detection & Resolution',
                 '4) Contextual Hierarchy (authority, recency, contextual relevance; explicitly state which source wins and why)',
                 '5) Mental Model',
@@ -1881,7 +1911,7 @@ ${evidenceDigest}`
             }
             sections.push(`${decisionMode ? (perspectiveMode ? '15' : '14') : (perspectiveMode ? '12' : '11')}) Uncertainties & Missing Information`);
             if (adversarialMode) {
-                sections.push('Include explicit adversarial sentence: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
+                sections.push('If disconfirming evidence is retrieved, include adversarial sentence: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."');
             }
             sections.push('Synthesis rule: do NOT write "Doc A says X, Doc B says Y". Every conclusion sentence must integrate multiple evidence points.');
             sections.push('Do not output a summary-only response.');
@@ -1916,7 +1946,7 @@ ${evidenceDigest}`
             if (!recent.length) {
                 return 'No prior conversational memory yet. Use this note only for dialogue continuity, not as factual evidence.';
             }
-            const lines = recent.map((item, idx) => `${idx + 1}. Q: ${item.query}\n   Gist: ${item.gist}`);
+            const lines = recent.map((item, idx) => `${idx + 1}. Prior user question: ${item.query}`);
             return [
                 'Conversation memory (continuity-only; not factual evidence):',
                 ...lines
@@ -1933,6 +1963,7 @@ ${evidenceDigest}`
             );
 
             const activationBlock = summarizeActivation(corpusStats.activationReport);
+            const adversarialEvidenceAvailable = Number(corpusStats?.activationReport?.adversarialChunks || 0) > 0;
             const modelBlock = corpusStats.superBrainMentalModelBlock || '';
             const decisionRules = instructionProfile?.decisionMode ? [
                 'DECISION-QUALITY MODE:',
@@ -1949,14 +1980,17 @@ ${evidenceDigest}`
                 '- Follow this cognitive loop: Interpret intent -> Retrieve corpus-wide semantically -> Build mental model -> Reason -> Refine if gaps remain.',
                 '- Human cognition emulation loop (mandatory in answer): Evidence Intake -> Attention Filtering -> Perception/Interpretation -> Dual-process reasoning (System1 + System2) -> Decision/Action -> Feedback Loop -> Bias check.',
                 '- Use concise chain-of-thought style decomposition via explicit sectioned reasoning, grounded only in cited evidence.',
-                '- Predictive coding mandate: start with a "Predictive Model" hypothesis BEFORE evidence synthesis, then explicitly compute prediction errors and resolve tension.',
+                '- Predictive coding mandate: start with a "Predictive Model" hypothesis BEFORE evidence synthesis, but label it as provisional/non-factual until citations confirm or reject it.',
                 '- Deep scan policy: do not assume early document sections are sufficient; include mid/late evidence when relevant.',
                 '- Hard response scaffold for prose answers: Executive Summary (Decision first) -> Predictive Model -> Prediction Errors/Tension Resolution -> Contextual Hierarchy -> Mental Model -> Human Cognitive Processing Loop -> Analytical Framework -> Explicitly Stated Facts -> Inferred Implications -> Evidence-Based Expert Analysis -> (Options & Trade-offs -> Recommendation -> Risks for decision queries) -> Uncertainties & Missing Information.',
                 '- Executive summary mandate: first section must start with a definitive decision, followed by reasoning path and actionable steps.',
                 '- Synthesis rule: do not produce "Doc A says..., Doc B says..." style narration; each conclusion sentence must integrate multiple evidence points.',
+                '- Contextual hierarchy rule: weighted ranking is triage only; final "which source wins" claims require explicit precedence language with citation.',
                 '- Use one explicit analytical framework (Pros/Cons, Stakeholder Analysis, Causal Chain, or Strength/Weakness) as the logic skeleton.',
                 '- Explicitly separate direct evidence from inference using section labels: "Explicitly Stated Facts" and "Inferred Implications".',
-                '- Run adversarial synthesis: include the sentence "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
+                adversarialEvidenceAvailable
+                    ? '- Run adversarial synthesis: include the sentence "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."'
+                    : '- Do not fabricate contradiction statements when no disconfirming evidence is retrieved.',
                 '- If perspective or stakeholder conflict is relevant, include at least two explicit viewpoints: "From Perspective A..." and "From Perspective B..."',
                 '- For broad/decision queries, conclusions must be supported by multiple sources when available; do not rely on one dominant document.',
                 '- Build an internal mental model before final answer:',
@@ -2040,18 +2074,18 @@ ${evidenceDigest}`
             if (!adversarialRetrieval && appRetriever?.lastAdversarialRetrieval) {
                 adversarialRetrieval = appRetriever.lastAdversarialRetrieval;
             }
-            if (!adversarialRetrieval && modelSources.length) {
+            if (!adversarialRetrieval) {
                 adversarialRetrieval = {
                     query,
                     passes: 0,
                     probes: [],
-                    chunks: modelSources.slice(0, Math.min(MAX_ADVERSARIAL_CHUNKS, 8))
+                    chunks: []
                 };
             }
             if (!predictiveModel) {
                 predictiveModel = {
                     query,
-                    anticipatedConclusion: `Likely requires balancing baseline rules with context-specific exceptions for: ${query}`,
+                    anticipatedConclusion: `Provisional non-factual prior unavailable; withhold conclusion until evidence synthesis is complete for: ${query}`,
                     hypotheses: [],
                     expectedEvidenceNeeds: [],
                     weightingPriors: {}
@@ -2135,7 +2169,9 @@ ${evidenceDigest}`
                     '   - Evidence-Based Expert Analysis',
                     '   - Uncertainties & Missing Information',
                     '4) Do not summarize only; provide reasoning, trade-offs, perspective analysis, and recommendation when appropriate.',
-                    '5) Include adversarial sentence with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."',
+                    (depthGate?.adversarialEvidenceAvailable
+                        ? '5) Include adversarial sentence with citation: "While the primary evidence suggests X, the corpus also contains evidence that contradicts/modifies this conclusion: [Citation]."'
+                        : '5) Do not fabricate contradiction statements when adversarial retrieval did not return disconfirming evidence.'),
                     '6) Avoid list-style narration like "Doc A says...". Integrate multiple evidence points per conclusion sentence.',
                     '7) Use prior chat memory only for continuity, never as factual evidence.',
                     '8) Normalize all citations to exact format [Source: filename, page X, "brief relevant quote"].',
