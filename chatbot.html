@@ -4216,5 +4216,751 @@ ${attachmentEvidence.contextText}`);
         boot();
     })();
     </script>
+    <script>
+    (function hardCognitionGuardrailPatch() {
+        'use strict';
+
+        const PATCH_VERSION = '2026-02-13-hard-cognition-guardrails-v1';
+        const WORLD_RULES_STORAGE_KEY = 'cse_world_rules_v1';
+
+        const WORLD_RULE_DEFAULTS = {
+            authoritativeBoundary: 'uploaded-corpus-only',
+            conflictPriority: 'newest-wins',
+            taskFraming: 'explain'
+        };
+
+        const SPREAD_DECAY = 0.68;
+        const MIN_SPREAD_SCORE = 0.16;
+        const MAX_ACTIVATED_CONCEPTS = 90;
+        const MAX_ACTIVATED_STATEMENTS = 180;
+        const MAX_STATEMENTS_PER_DOC = 12;
+
+        const STOP_WORDS = new Set([
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be',
+            'been', 'it', 'this', 'that', 'these', 'those', 'can', 'could',
+            'should', 'would', 'may', 'might', 'will', 'also', 'than', 'then'
+        ]);
+
+        function hashLite(text) {
+            const s = String(text || '');
+            let h = 2166136261;
+            for (let i = 0; i < s.length; i++) {
+                h ^= s.charCodeAt(i);
+                h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+            }
+            return (h >>> 0).toString(16);
+        }
+
+        function normalizeText(text) {
+            return String(text || '')
+                .toLowerCase()
+                .replace(/[^\w\s-]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        function tokenize(text) {
+            return normalizeText(text)
+                .split(/\s+/)
+                .filter(token => token.length > 2 && !STOP_WORDS.has(token));
+        }
+
+        function splitSentences(text) {
+            return String(text || '')
+                .replace(/\r\n/g, '\n')
+                .split(/(?<=[.!?])\s+|\n+/)
+                .map(s => s.trim())
+                .filter(Boolean);
+        }
+
+        function uniqueBy(items, keyFn) {
+            const seen = new Set();
+            const out = [];
+            for (const item of items || []) {
+                const key = keyFn(item);
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                out.push(item);
+            }
+            return out;
+        }
+
+        function overlapScore(a, b) {
+            const ta = new Set(tokenize(a));
+            const tb = new Set(tokenize(b));
+            if (!ta.size || !tb.size) return 0;
+            let inter = 0;
+            for (const t of ta) if (tb.has(t)) inter++;
+            return inter / Math.max(ta.size, tb.size);
+        }
+
+        function cleanQuote(text, maxLen = 110) {
+            return String(text || '')
+                .replace(/["“”]/g, "'")
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, maxLen);
+        }
+
+        function extractConceptCandidates(text) {
+            const t = tokenize(text);
+            const freq = new Map();
+            for (const token of t) freq.set(token, (freq.get(token) || 0) + 1);
+
+            const unigrams = Array.from(freq.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 12)
+                .map(([token]) => token);
+
+            const bigrams = [];
+            for (let i = 0; i < t.length - 1; i++) {
+                bigrams.push(`${t[i]} ${t[i + 1]}`);
+            }
+            return uniqueBy([...unigrams, ...bigrams], x => x).slice(0, 18);
+        }
+
+        function resolveStatementType(sentence) {
+            const s = sentence.toLowerCase();
+            if (/\b(defined as|refers to|means|is called)\b/.test(s)) return 'definition';
+            if (/\b(causes?|leads to|results in|therefore|because)\b/.test(s)) return 'causal';
+            if (/\b(except|unless|however|but only|notwithstanding)\b/.test(s)) return 'exception';
+            if (/\b(must|shall|required|cannot|prohibited|only if)\b/.test(s)) return 'rule';
+            if (/\b(for example|e\.g\.|such as)\b/.test(s)) return 'example';
+            return 'fact';
+        }
+
+        function resolveLinkType(sentence, statementType) {
+            const s = sentence.toLowerCase();
+            if (statementType === 'definition') return 'defines';
+            if (statementType === 'causal') return 'causes';
+            if (statementType === 'exception') return 'exception-to';
+            if (/\b(depends on|requires?)\b/.test(s)) return 'depends-on';
+            if (/\b(part of|component of|includes)\b/.test(s)) return 'part-of';
+            if (/\b(for example|such as)\b/.test(s)) return 'example-of';
+            if (/\b(prerequisite|required before)\b/.test(s)) return 'prerequisite-for';
+            return 'depends-on';
+        }
+
+        function modalityTag(text) {
+            const s = String(text || '').toLowerCase();
+            if (/\b(cannot|must not|prohibited|forbidden|ineligible)\b/.test(s)) return 'forbid';
+            if (/\b(must|required|shall|only if)\b/.test(s)) return 'require';
+            if (/\b(may|can|allowed|eligible)\b/.test(s)) return 'permit';
+            return 'neutral';
+        }
+
+        function inferVersionTag(doc) {
+            const filename = String(doc.filename || '');
+            const versionMatch = filename.match(/\bv(?:ersion)?\s*([0-9]+(?:\.[0-9]+)*)\b/i);
+            if (versionMatch) return `v${versionMatch[1]}`;
+            const yearMatch = filename.match(/\b(19|20)\d{2}\b/);
+            if (yearMatch) return yearMatch[0];
+            const ts = doc.uploadedAt ? new Date(doc.uploadedAt) : new Date();
+            return `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, '0')}`;
+        }
+
+        function loadWorldRules() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(WORLD_RULES_STORAGE_KEY) || '{}');
+                return { ...WORLD_RULE_DEFAULTS, ...parsed };
+            } catch {
+                return { ...WORLD_RULE_DEFAULTS };
+            }
+        }
+
+        function saveWorldRules(rules) {
+            localStorage.setItem(WORLD_RULES_STORAGE_KEY, JSON.stringify(rules));
+        }
+
+        function deriveAtomicKnowledge(doc) {
+            const statementList = [];
+            const typedLinks = [];
+            const conceptRegistryMap = new Map();
+
+            const versionTag = inferVersionTag(doc);
+            const chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
+
+            for (const chunk of chunks) {
+                const sentences = splitSentences(chunk.text)
+                    .filter(s => s.length >= 28 && s.length <= 380)
+                    .slice(0, 18);
+
+                for (let i = 0; i < sentences.length; i++) {
+                    const sentence = sentences[i];
+                    const concepts = extractConceptCandidates(sentence);
+                    if (!concepts.length) continue;
+
+                    const stType = resolveStatementType(sentence);
+                    const statementId = `stmt-${hashLite(`${doc.filename}|${chunk.id}|${i}|${sentence.slice(0, 120)}`)}`;
+                    const statement = {
+                        id: statementId,
+                        type: stType,
+                        text: sentence,
+                        concepts,
+                        filename: doc.filename,
+                        section: chunk.section || 'Document',
+                        page: chunk.page || null,
+                        chunkId: chunk.id,
+                        versionTag,
+                        uploadedAt: doc.uploadedAt || new Date().toISOString()
+                    };
+                    statementList.push(statement);
+
+                    for (const concept of concepts) {
+                        if (!conceptRegistryMap.has(concept)) {
+                            conceptRegistryMap.set(concept, {
+                                canonical: concept,
+                                aliases: [concept],
+                                statementIds: []
+                            });
+                        }
+                        conceptRegistryMap.get(concept).statementIds.push(statementId);
+                    }
+
+                    for (let j = 0; j < concepts.length - 1; j++) {
+                        const from = concepts[j];
+                        const to = concepts[j + 1];
+                        const linkType = resolveLinkType(sentence, stType);
+                        typedLinks.push({
+                            id: `lnk-${hashLite(`${statementId}|${from}|${to}|${linkType}`)}`,
+                            from,
+                            to,
+                            type: linkType,
+                            statementId,
+                            provenance: {
+                                filename: statement.filename,
+                                section: statement.section,
+                                page: statement.page,
+                                versionTag
+                            }
+                        });
+                    }
+                }
+            }
+
+            doc.atomicStatements = statementList.slice(0, 7000);
+            doc.typedLinks = typedLinks.slice(0, 14000);
+            doc.conceptRegistry = Array.from(conceptRegistryMap.values()).map(item => ({
+                ...item,
+                statementIds: uniqueBy(item.statementIds, x => x)
+            }));
+            doc.scopeMetadata = {
+                authority: 'uploaded-corpus',
+                versionTag,
+                ingestedAt: new Date().toISOString()
+            };
+            doc.indexingPasses = {
+                coarse: {
+                    headings: (doc.memory?.outline || []).slice(0, 24),
+                    keyTerms: (doc.memory?.keyConcepts || []).slice(0, 18)
+                },
+                deep: {
+                    atomicStatements: doc.atomicStatements.length,
+                    typedLinks: doc.typedLinks.length
+                },
+                refinement: {
+                    duplicatesCollapsed: Math.max(0, statementList.length - doc.atomicStatements.length),
+                    scopeTagged: true
+                }
+            };
+            doc.memory = {
+                ...(doc.memory || {}),
+                atomicStatementCount: doc.atomicStatements.length,
+                typedLinkCount: doc.typedLinks.length
+            };
+            return doc;
+        }
+
+        function statementCitation(statement) {
+            return `[Source: ${statement.filename}, page ${statement.page || 'N/A'}, "${cleanQuote(statement.text, 105)}"]`;
+        }
+
+        function patchMethod(klass, methodName, wrapperFactory) {
+            if (!klass || !klass.prototype) return false;
+            const original = klass.prototype[methodName];
+            if (typeof original !== 'function') return false;
+            if (original.__hardCognitionPatch === PATCH_VERSION) return true;
+            const wrapped = wrapperFactory(original);
+            wrapped.__hardCognitionPatch = PATCH_VERSION;
+            klass.prototype[methodName] = wrapped;
+            return true;
+        }
+
+        function installWorldRuleControls() {
+            const adminBody = document.querySelector('.admin-body');
+            if (!adminBody || document.getElementById('worldRulesSection')) return;
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'api-section';
+            wrapper.id = 'worldRulesSection';
+            wrapper.innerHTML = `
+                <h4>World Definition Controls</h4>
+                <p class="model-note">Define authority boundary, conflict priority, and task framing.</p>
+                <div style="display:grid;gap:.6rem;">
+                    <label style="font-size:.84rem;">Authoritative boundary
+                        <select id="worldAuthoritySelect" class="model-select">
+                            <option value="uploaded-corpus-only">Uploaded corpus only</option>
+                            <option value="uploaded-and-attachment">Uploaded corpus + current attachment</option>
+                        </select>
+                    </label>
+                    <label style="font-size:.84rem;">Conflict priority
+                        <select id="worldPrioritySelect" class="model-select">
+                            <option value="newest-wins">Newest version wins</option>
+                            <option value="oldest-wins">Oldest version wins</option>
+                            <option value="show-conflicts">Always show conflict set</option>
+                        </select>
+                    </label>
+                    <label style="font-size:.84rem;">Task framing
+                        <select id="worldTaskSelect" class="model-select">
+                            <option value="explain">Explain</option>
+                            <option value="compute">Compute</option>
+                            <option value="decide">Decide</option>
+                            <option value="troubleshoot">Troubleshoot</option>
+                        </select>
+                    </label>
+                    <button id="saveWorldRulesBtn" class="api-save-btn">Save World Rules</button>
+                </div>
+            `;
+
+            const uploadZone = document.getElementById('uploadZone');
+            if (uploadZone && uploadZone.parentNode) uploadZone.parentNode.insertBefore(wrapper, uploadZone);
+            else adminBody.appendChild(wrapper);
+
+            const rules = loadWorldRules();
+            const authority = document.getElementById('worldAuthoritySelect');
+            const priority = document.getElementById('worldPrioritySelect');
+            const task = document.getElementById('worldTaskSelect');
+            if (authority) authority.value = rules.authoritativeBoundary;
+            if (priority) priority.value = rules.conflictPriority;
+            if (task) task.value = rules.taskFraming;
+        }
+
+        function install() {
+            if (typeof DocumentProcessor !== 'function' || typeof CognitiveRetriever !== 'function' || typeof CognitiveSynthesizer !== 'function') {
+                return false;
+            }
+
+            patchMethod(DocumentProcessor, 'processFile', (original) => async function patchedProcessFile(file) {
+                const doc = await original.call(this, file);
+                return deriveAtomicKnowledge(doc);
+            });
+
+            if (typeof CognitiveRetriever.prototype.buildKnowledgeNetwork !== 'function') {
+                CognitiveRetriever.prototype.buildKnowledgeNetwork = function buildKnowledgeNetwork(documents = []) {
+                    const network = {
+                        conceptToStatementIds: new Map(),
+                        conceptAdjacency: new Map(),
+                        statementById: new Map(),
+                        contradictionPairs: []
+                    };
+
+                    const addEdge = (from, to, link) => {
+                        if (!from || !to) return;
+                        if (!network.conceptAdjacency.has(from)) network.conceptAdjacency.set(from, []);
+                        network.conceptAdjacency.get(from).push({ to, linkType: link.type, statementId: link.statementId, weight: 1 });
+                    };
+
+                    for (const doc of documents) {
+                        const statements = Array.isArray(doc.atomicStatements) ? doc.atomicStatements : [];
+                        const links = Array.isArray(doc.typedLinks) ? doc.typedLinks : [];
+
+                        for (const statement of statements) {
+                            network.statementById.set(statement.id, statement);
+                            for (const concept of (statement.concepts || [])) {
+                                if (!network.conceptToStatementIds.has(concept)) network.conceptToStatementIds.set(concept, new Set());
+                                network.conceptToStatementIds.get(concept).add(statement.id);
+                            }
+                        }
+
+                        for (const link of links) addEdge(link.from, link.to, link);
+                    }
+
+                    const statements = Array.from(network.statementById.values()).slice(0, 2200);
+                    for (let i = 0; i < statements.length; i++) {
+                        for (let j = i + 1; j < statements.length; j++) {
+                            const a = statements[i];
+                            const b = statements[j];
+                            if (a.filename === b.filename && a.versionTag === b.versionTag) continue;
+                            if (overlapScore(a.text, b.text) < 0.58) continue;
+                            const ma = modalityTag(a.text);
+                            const mb = modalityTag(b.text);
+                            const opposite = (ma === 'require' && mb === 'forbid') || (ma === 'forbid' && mb === 'permit') || (ma === 'permit' && mb === 'forbid');
+                            if (!opposite) continue;
+                            network.contradictionPairs.push({ a, b });
+                            if (network.contradictionPairs.length >= 80) break;
+                        }
+                        if (network.contradictionPairs.length >= 80) break;
+                    }
+                    return network;
+                };
+            }
+
+            if (typeof CognitiveRetriever.prototype.buildWorkingMemoryBuffer !== 'function') {
+                CognitiveRetriever.prototype.buildWorkingMemoryBuffer = function buildWorkingMemoryBuffer(query) {
+                    const network = this.knowledgeNetwork;
+                    if (!network) return { activatedConcepts: [], statements: [], chunks: [], missingConcepts: [], coverage: { docs: 0, statements: 0 } };
+
+                    const queryConcepts = extractConceptCandidates(query);
+                    const activationScores = new Map();
+                    const queue = [];
+
+                    for (const concept of queryConcepts) {
+                        if (!network.conceptToStatementIds.has(concept)) continue;
+                        activationScores.set(concept, 1);
+                        queue.push({ concept, score: 1 });
+                    }
+
+                    while (queue.length && activationScores.size < MAX_ACTIVATED_CONCEPTS) {
+                        const current = queue.shift();
+                        const neighbors = network.conceptAdjacency.get(current.concept) || [];
+                        for (const edge of neighbors) {
+                            const edgeBoost = edge.linkType === 'contradicts' ? 0.86 : 1.0;
+                            const nextScore = current.score * SPREAD_DECAY * edgeBoost;
+                            if (nextScore < MIN_SPREAD_SCORE) continue;
+                            const prev = activationScores.get(edge.to) || 0;
+                            if (nextScore > prev) {
+                                activationScores.set(edge.to, nextScore);
+                                queue.push({ concept: edge.to, score: nextScore });
+                            }
+                        }
+                    }
+
+                    const scoredStatements = [];
+                    const queryTokens = tokenize(query);
+                    for (const [concept, score] of activationScores.entries()) {
+                        const ids = network.conceptToStatementIds.get(concept) || new Set();
+                        for (const statementId of ids) {
+                            const st = network.statementById.get(statementId);
+                            if (!st) continue;
+                            const lexical = queryTokens.length ? overlapScore(query, st.text) : 0;
+                            scoredStatements.push({
+                                ...st,
+                                activationScore: score,
+                                localScore: lexical,
+                                score: (score * 0.65) + (lexical * 0.35)
+                            });
+                        }
+                    }
+
+                    const orderedStatements = uniqueBy(scoredStatements.sort((a, b) => b.score - a.score), x => x.id);
+                    const perDoc = new Map();
+                    const selectedStatements = [];
+                    for (const st of orderedStatements) {
+                        if (selectedStatements.length >= MAX_ACTIVATED_STATEMENTS) break;
+                        const docCount = perDoc.get(st.filename) || 0;
+                        if (docCount >= MAX_STATEMENTS_PER_DOC) continue;
+                        perDoc.set(st.filename, docCount + 1);
+                        selectedStatements.push(st);
+                    }
+
+                    const chunkScores = new Map();
+                    for (const st of selectedStatements) {
+                        if (!st.chunkId) continue;
+                        chunkScores.set(st.chunkId, Math.max(chunkScores.get(st.chunkId) || 0, st.score));
+                    }
+
+                    const selectedChunks = [];
+                    for (const [chunkId, score] of chunkScores.entries()) {
+                        const chunk = this.chunkLookup.get(chunkId);
+                        if (!chunk) continue;
+                        selectedChunks.push({ ...chunk, score: Math.max(chunk.score || 0, score + 0.08) });
+                    }
+                    selectedChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+                    const activatedConcepts = Array.from(activationScores.entries())
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([concept, score]) => ({ concept, score }));
+                    const missingConcepts = queryConcepts.filter(concept => !activationScores.has(concept)).slice(0, 12);
+                    return {
+                        activatedConcepts,
+                        statements: selectedStatements,
+                        chunks: selectedChunks,
+                        missingConcepts,
+                        coverage: { docs: perDoc.size, statements: selectedStatements.length },
+                        contradictionPairs: network.contradictionPairs || []
+                    };
+                };
+            }
+
+            patchMethod(CognitiveRetriever, 'updateCorpus', (original) => function patchedUpdateCorpus(documents) {
+                const enrichedDocs = (documents || []).map(doc => {
+                    if (Array.isArray(doc.atomicStatements) && Array.isArray(doc.typedLinks)) return doc;
+                    return deriveAtomicKnowledge({ ...doc });
+                });
+                const result = original.call(this, enrichedDocs);
+                this.knowledgeNetwork = this.buildKnowledgeNetwork(enrichedDocs);
+                return result;
+            });
+
+            patchMethod(CognitiveRetriever, 'retrieve', (original) => async function patchedRetrieve(query, topK = null, options = {}) {
+                const base = await original.call(this, query, topK, options);
+                const workingMemory = this.buildWorkingMemoryBuffer(query);
+                this.lastWorkingMemoryBuffer = workingMemory;
+
+                const targetK = topK || Math.max(12, base.length || 12);
+                const merged = this.mergeUniqueChunks
+                    ? this.mergeUniqueChunks(base, workingMemory.chunks, Math.max(targetK * 2, 80))
+                    : uniqueBy([...(base || []), ...(workingMemory.chunks || [])], item => item.id).slice(0, Math.max(targetK * 2, 80));
+
+                const diversified = this.diversifyResults
+                    ? this.diversifyResults(merged.sort((a, b) => (b.score || 0) - (a.score || 0)), targetK)
+                    : merged.slice(0, targetK);
+
+                return diversified.slice(0, targetK);
+            });
+
+            if (typeof CognitiveSynthesizer.prototype.extractClaimsForGate !== 'function') {
+                CognitiveSynthesizer.prototype.extractClaimsForGate = function extractClaimsForGate(text) {
+                    const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean);
+                    const fromLines = lines
+                        .map(line => line.replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, '').trim())
+                        .filter(line => line.length > 24 && !/^\[Source:/i.test(line));
+                    const fromSentences = splitSentences(text).filter(sentence => sentence.length > 24);
+                    return uniqueBy([...fromLines, ...fromSentences], x => x).slice(0, 80);
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.enforceEvidenceGate !== 'function') {
+                CognitiveSynthesizer.prototype.enforceEvidenceGate = function enforceEvidenceGate(claims = [], statements = []) {
+                    const admitted = [];
+                    const rejected = [];
+                    for (const claim of claims) {
+                        const ranked = statements
+                            .map(statement => ({ statement, score: overlapScore(claim, statement.text) }))
+                            .sort((a, b) => b.score - a.score);
+                        const top1 = ranked[0];
+                        const top2 = ranked[1];
+
+                        if (top1 && top1.score >= 0.48) {
+                            admitted.push({
+                                claim,
+                                mode: 'direct-source',
+                                inputStatementIds: [top1.statement.id],
+                                outputClaim: claim,
+                                citations: [statementCitation(top1.statement)]
+                            });
+                            continue;
+                        }
+
+                        if (top1 && top2 && top1.score >= 0.34 && top2.score >= 0.34) {
+                            admitted.push({
+                                claim,
+                                mode: 'constrained-entailment',
+                                inputStatementIds: [top1.statement.id, top2.statement.id],
+                                outputClaim: claim,
+                                citations: [statementCitation(top1.statement), statementCitation(top2.statement)]
+                            });
+                            continue;
+                        }
+
+                        rejected.push(claim);
+                    }
+                    return { admitted, rejected };
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.buildMentalModelFromBuffer !== 'function') {
+                CognitiveSynthesizer.prototype.buildMentalModelFromBuffer = function buildMentalModelFromBuffer(query, buffer = {}, worldRules = WORLD_RULE_DEFAULTS) {
+                    const statements = buffer.statements || [];
+                    const queryConcepts = extractConceptCandidates(query);
+                    const activeConceptSet = new Set((buffer.activatedConcepts || []).map(item => item.concept));
+                    const constraints = statements
+                        .filter(statement => statement.type === 'rule' || statement.type === 'exception')
+                        .slice(0, 8)
+                        .map(statement => statement.text);
+                    const knowns = statements.slice(0, 8).map(statement => statement.text);
+                    const unknowns = queryConcepts.filter(concept => !activeConceptSet.has(concept)).slice(0, 10);
+                    return {
+                        taskFraming: worldRules.taskFraming,
+                        variables: queryConcepts.slice(0, 12),
+                        knowns,
+                        unknowns,
+                        constraints
+                    };
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.runSelfChecksFromBuffer !== 'function') {
+                CognitiveSynthesizer.prototype.runSelfChecksFromBuffer = function runSelfChecksFromBuffer(buffer = {}, worldRules = WORLD_RULE_DEFAULTS) {
+                    const statements = buffer.statements || [];
+                    const contradictions = (buffer.contradictionPairs || []).slice(0, 6);
+                    const exceptionStatements = statements.filter(statement => statement.type === 'exception').slice(0, 6);
+                    const versionList = uniqueBy(statements.map(statement => `${statement.filename} (${statement.versionTag || 'N/A'})`), x => x).slice(0, 10);
+
+                    return [
+                        {
+                            name: 'Consistency check',
+                            status: contradictions.length ? 'warning' : 'pass',
+                            details: contradictions.length
+                                ? contradictions.slice(0, 3).map(pair => `Potential contradiction: "${cleanQuote(pair.a.text, 80)}" vs "${cleanQuote(pair.b.text, 80)}"`).join(' | ')
+                                : 'No high-signal contradictions detected in active evidence.'
+                        },
+                        {
+                            name: 'Counterexample search',
+                            status: exceptionStatements.length ? 'warning' : 'pass',
+                            details: exceptionStatements.length
+                                ? exceptionStatements.map(statement => `${cleanQuote(statement.text, 95)} ${statementCitation(statement)}`).slice(0, 3).join(' | ')
+                                : 'No explicit exception statement activated.'
+                        },
+                        {
+                            name: 'Scope/version check',
+                            status: 'pass',
+                            details: `Priority rule: ${worldRules.conflictPriority}; Active versions: ${versionList.join(', ') || 'N/A'}`
+                        }
+                    ];
+                };
+            }
+
+            if (typeof CognitiveSynthesizer.prototype.formatCognitiveReport !== 'function') {
+                CognitiveSynthesizer.prototype.formatCognitiveReport = function formatCognitiveReport(query, worldRules, buffer, model, gate, checks) {
+                    const evidenceMap = (buffer.activatedConcepts || []).slice(0, 12)
+                        .map(item => `- ${item.concept} (activation ${item.score.toFixed(2)})`)
+                        .join('\n');
+
+                    const ledger = gate.admitted.map((item, idx) => {
+                        return `Step ${idx + 1}
+- Transformation: ${item.mode}
+- Input statement IDs: ${item.inputStatementIds.join(', ')}
+- Resulting statement: ${item.outputClaim}
+- Citations: ${item.citations.join(' ')}`;
+                    }).join('\n\n');
+
+                    const confidence = gate.admitted.length >= 4 && gate.rejected.length <= 2
+                        ? 'Supported'
+                        : gate.admitted.length > 0
+                            ? 'Partially supported'
+                            : 'Insufficient evidence';
+
+                    const missingBlock = gate.rejected.length
+                        ? `Insufficient support in provided sources for: ${gate.rejected.slice(0, 6).join(' | ')}`
+                        : 'No unsupported claims remain after evidence gate filtering.';
+
+                    return [
+                        `World Definition`,
+                        `- Authoritative boundary: ${worldRules.authoritativeBoundary}`,
+                        `- Conflict priority: ${worldRules.conflictPriority}`,
+                        `- Task framing: ${worldRules.taskFraming}`,
+                        ``,
+                        `Mental Model Summary`,
+                        `- Query: ${query}`,
+                        `- Variables: ${(model.variables || []).join(', ') || 'N/A'}`,
+                        `- Knowns: ${(model.knowns || []).slice(0, 4).join(' | ') || 'N/A'}`,
+                        `- Constraints: ${(model.constraints || []).slice(0, 4).join(' | ') || 'N/A'}`,
+                        `- Unknowns: ${(model.unknowns || []).join(', ') || 'None identified'}`,
+                        ``,
+                        `Evidence Map`,
+                        `- Activated documents: ${buffer.coverage?.docs || 0}`,
+                        `- Activated statements: ${buffer.coverage?.statements || 0}`,
+                        `${evidenceMap || '- N/A'}`,
+                        ``,
+                        `Step-by-Step Reasoning Ledger`,
+                        `${ledger || 'No admissible ledger steps.'}`,
+                        ``,
+                        `Conclusion`,
+                        `- Confidence: ${confidence}`,
+                        `- Admissible claims: ${gate.admitted.length}`,
+                        `- Rejected claims: ${gate.rejected.length}`,
+                        ``,
+                        `Self-Checks`,
+                        ...(checks || []).map(check => `- ${check.name} (${check.status}): ${check.details}`),
+                        ``,
+                        `Uncertainties & Missing Information`,
+                        `${missingBlock}`
+                    ].join('\n');
+                };
+            }
+
+            patchMethod(CognitiveSynthesizer, 'synthesize', (original) => async function patchedSynthesize(query, relevantChunks, attachmentContext = null, corpusStats = {}) {
+                const result = await original.call(this, query, relevantChunks, attachmentContext, corpusStats);
+                const retriever = (typeof window !== 'undefined' && window.app?.retriever) ? window.app.retriever : null;
+                const worldRules = loadWorldRules();
+                const buffer = retriever?.lastWorkingMemoryBuffer || retriever?.buildWorkingMemoryBuffer?.(query) || {
+                    activatedConcepts: [],
+                    statements: [],
+                    chunks: [],
+                    missingConcepts: [],
+                    coverage: { docs: 0, statements: 0 },
+                    contradictionPairs: []
+                };
+
+                const claims = this.extractClaimsForGate(result?.response || '');
+                const gate = this.enforceEvidenceGate(claims, buffer.statements || []);
+                const checks = this.runSelfChecksFromBuffer(buffer, worldRules);
+
+                if (gate.admitted.length === 0) {
+                    result.response = [
+                        'Conclusion',
+                        '- Confidence: Insufficient evidence',
+                        '- Insufficient support in provided sources.',
+                        '',
+                        'Uncertainties & Missing Information',
+                        `- Missing support for: ${(gate.rejected || []).slice(0, 8).join(' | ') || 'all candidate claims'}`
+                    ].join('\n');
+                    result.meta = {
+                        ...(result.meta || {}),
+                        hardCognitionPatch: PATCH_VERSION,
+                        abstained: true,
+                        worldRules
+                    };
+                    return result;
+                }
+
+                const model = this.buildMentalModelFromBuffer(query, buffer, worldRules);
+                result.response = this.formatCognitiveReport(query, worldRules, buffer, model, gate, checks);
+                result.meta = {
+                    ...(result.meta || {}),
+                    hardCognitionPatch: PATCH_VERSION,
+                    worldRules,
+                    activationCoverage: buffer.coverage || { docs: 0, statements: 0 },
+                    admittedClaims: gate.admitted.length,
+                    rejectedClaims: gate.rejected.length
+                };
+                return result;
+            });
+
+            patchMethod(UIController, 'initializeElements', (original) => function patchedInitializeElements() {
+                original.call(this);
+                installWorldRuleControls();
+            });
+
+            patchMethod(UIController, 'bindEvents', (original) => function patchedBindEvents() {
+                original.call(this);
+                const saveButton = document.getElementById('saveWorldRulesBtn');
+                if (!saveButton || saveButton.__worldRulesBound) return;
+                saveButton.__worldRulesBound = true;
+                saveButton.addEventListener('click', () => {
+                    const rules = {
+                        authoritativeBoundary: document.getElementById('worldAuthoritySelect')?.value || WORLD_RULE_DEFAULTS.authoritativeBoundary,
+                        conflictPriority: document.getElementById('worldPrioritySelect')?.value || WORLD_RULE_DEFAULTS.conflictPriority,
+                        taskFraming: document.getElementById('worldTaskSelect')?.value || WORLD_RULE_DEFAULTS.taskFraming
+                    };
+                    saveWorldRules(rules);
+                    if (typeof this.showToast === 'function') this.showToast('World rules saved', 'success');
+                });
+            });
+
+            try {
+                if (typeof window !== 'undefined' && window.app?.retriever && window.app.retriever.updateCorpus) {
+                    window.app.retriever.updateCorpus(window.app.retriever.documents || []);
+                }
+            } catch {}
+
+            try {
+                console.log(`[Hard Cognition Guardrail Patch] applied (${PATCH_VERSION})`);
+            } catch {}
+            return true;
+        }
+
+        function boot(attempt = 0) {
+            const ok = install();
+            if (ok) return;
+            if (attempt > 120) return;
+            setTimeout(() => boot(attempt + 1), 50);
+        }
+
+        boot();
+    })();
+    </script>
 </body>
 </html>
