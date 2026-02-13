@@ -1784,7 +1784,10 @@ ${evidenceDigest}`
             };
         });
 
-        patchMethod(CognitiveSynthesizer, 'getWorkingMemorySummary', () => function patchedWorkingMemorySummary() {
+        patchMethod(CognitiveSynthesizer, 'getWorkingMemorySummary', () => function patchedWorkingMemorySummary(query = '') {
+            if (typeof this.shouldUseContinuityMemory === 'function' && !this.shouldUseContinuityMemory(query)) {
+                return 'Continuity memory not applied for this standalone query.';
+            }
             const recent = Array.isArray(this.workingMemory) ? this.workingMemory.slice(-6) : [];
             if (!recent.length) {
                 return 'No prior conversational memory yet. Use this note only for dialogue continuity, not as factual evidence.';
@@ -1925,20 +1928,13 @@ ${evidenceDigest}`
             localStats.superBrainPredictiveBlock = this.superBrainBuildPredictiveResolutionBlock(query, predictiveModel, modelSources);
             localStats.superBrainHierarchyBlock = this.superBrainBuildContextualHierarchyBlock(query, modelSources);
 
-            const historySnapshot = Array.isArray(this.conversationHistory) ? [...this.conversationHistory] : [];
-            const continuityHistory = historySnapshot.slice(-12);
             let result;
-            let latestTurn = [];
             const prevSkipFlag = !!this.__skipCoreStrictPostProcessing;
             try {
                 this.__skipCoreStrictPostProcessing = true;
-                this.conversationHistory = continuityHistory;
                 result = await original.call(this, query, refinedChunks, attachmentContext, localStats);
-                latestTurn = Array.isArray(this.conversationHistory) ? this.conversationHistory.slice(-2) : [];
             } finally {
                 this.__skipCoreStrictPostProcessing = prevSkipFlag;
-                this.conversationHistory = [...historySnapshot, ...latestTurn].slice(-40);
-                if (typeof this.saveChatHistory === 'function') this.saveChatHistory();
             }
 
             if (!result || typeof result.response !== 'string') return result;

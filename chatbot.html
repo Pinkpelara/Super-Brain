@@ -2080,7 +2080,18 @@
             };
         }
 
-        getWorkingMemorySummary() {
+        shouldUseContinuityMemory(query = '') {
+            const value = String(query || '').trim();
+            if (!value) return false;
+            const isShort = value.split(/\s+/).filter(Boolean).length <= 14;
+            const hasFollowUpCue = /\b(this|that|these|those|it|they|them|above|previous|earlier|prior|last answer|as mentioned|same (?:policy|document|topic)|continue|follow[- ]?up)\b/i.test(value);
+            return hasFollowUpCue || isShort;
+        }
+
+        getWorkingMemorySummary(query = '') {
+            if (!this.shouldUseContinuityMemory(query)) {
+                return 'Continuity memory not applied for this standalone query.';
+            }
             if (!this.workingMemory.length) return 'No prior working memory yet.';
             return this.workingMemory
                 .slice(-6)
@@ -2908,7 +2919,8 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
         async synthesize(query, relevantChunks, attachmentContext = null, corpusStats = {}) {
             if (!this.apiKey) throw new Error('API key not configured. Please set your OpenAI API key in the Admin Panel.');
             const instructionProfile = this.buildInstructionProfile(query);
-            const workingMemorySummary = this.getWorkingMemorySummary();
+            const useContinuityMemory = this.shouldUseContinuityMemory(query);
+            const workingMemorySummary = this.getWorkingMemorySummary(query);
             const cognitivePlan = await this.buildCognitivePlan(query, instructionProfile, corpusStats, attachmentContext);
             const useMultiPass = this.shouldUseMultiPass(relevantChunks, attachmentContext, corpusStats, cognitivePlan);
 
@@ -2971,9 +2983,18 @@ ${attachmentEvidence.contextText}`);
             const context = budgetedContext.context;
             const systemPrompt = this.getSystemPrompt(context, corpusStats, instructionProfile, workingMemorySummary);
             const userPrompt = this.buildUserPrompt(query, instructionProfile);
+            const continuityMessages = useContinuityMemory
+                ? this.conversationHistory
+                    .filter(item => item?.role === 'user')
+                    .slice(-3)
+                    .map(item => ({
+                        role: 'user',
+                        content: `Prior user context for continuity only (not source evidence): ${String(item.content || '').slice(0, 500)}`
+                    }))
+                : [];
             let messages = [
                 { role: 'system', content: systemPrompt },
-                ...this.conversationHistory.slice(-10),
+                ...continuityMessages,
                 { role: 'user', content: userPrompt }
             ];
 
@@ -2992,7 +3013,7 @@ ${attachmentEvidence.contextText}`);
                 const retrySystemPrompt = this.getSystemPrompt(retryBudgetedContext.context, corpusStats, instructionProfile, workingMemorySummary);
                 messages = [
                     { role: 'system', content: retrySystemPrompt },
-                    ...this.conversationHistory.slice(-6),
+                    ...continuityMessages,
                     { role: 'user', content: userPrompt }
                 ];
                 assistantMessage = await this.callCompletion(messages, {
@@ -5975,7 +5996,10 @@ ${attachmentEvidence.contextText}`);
                 };
             });
 
-            patchMethod(CognitiveSynthesizer, 'getWorkingMemorySummary', () => function patchedWorkingMemorySummary() {
+            patchMethod(CognitiveSynthesizer, 'getWorkingMemorySummary', () => function patchedWorkingMemorySummary(query = '') {
+                if (typeof this.shouldUseContinuityMemory === 'function' && !this.shouldUseContinuityMemory(query)) {
+                    return 'Continuity memory not applied for this standalone query.';
+                }
                 const recent = Array.isArray(this.workingMemory) ? this.workingMemory.slice(-6) : [];
                 if (!recent.length) {
                     return 'No prior conversational memory yet. Use this note only for dialogue continuity, not as factual evidence.';

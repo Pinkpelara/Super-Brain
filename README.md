@@ -104,6 +104,7 @@ The current implementation hard-wires previously fragile features:
   - fallback model chain on transient API failures,
   - telemetry for cache hits and fallback usage.
 - Chat restore/render path now escapes user/system content before HTML injection points to prevent stored HTML/script injection.
+- Continuity memory is now applied only for explicit follow-up queries; standalone questions no longer inject prior chat turns by default.
 - Stop-word token sets are reused instead of recreated per call in hot paths.
 
 ---
