@@ -17,7 +17,7 @@
 (function superBrainRagPatch() {
     'use strict';
 
-    const PATCH_VERSION = '2026.02.11-superbrain-v5';
+    const PATCH_VERSION = '2026.02.11-superbrain-v6';
     const FULL_SWEEP_MIN_ANCHORS_PER_DOC = 2;
     const DEFAULT_TARGET_K_SMALL = 22;
     const DEFAULT_TARGET_K_MEDIUM = 30;
@@ -381,6 +381,21 @@
                 const hint = String(recentUser.content || '').replace(/\s+/g, ' ').trim().slice(0, 240);
                 if (!hint) return raw;
                 return `${raw}\n\n[Continuity hint from prior user turn: ${hint}]`;
+            };
+        }
+
+        if (typeof CognitiveRetriever.prototype.superBrainSanitizeRetrievalQuery !== 'function') {
+            CognitiveRetriever.prototype.superBrainSanitizeRetrievalQuery = function superBrainSanitizeRetrievalQuery(query) {
+                const raw = String(query || '').replace(/\s+/g, ' ').trim();
+                if (!raw) return raw;
+                const diagnosticMarkers = /\b(example output|for troubleshooting|troubleshoot|debug|not to tailor|what is going on)\b/i.test(raw);
+                if (!diagnosticMarkers) return raw;
+                const blockStart = String(query || '').search(/\n##\s+[A-Za-z]/);
+                if (blockStart > 0) {
+                    const head = String(query || '').slice(0, blockStart).replace(/\s+/g, ' ').trim();
+                    if (head) return head;
+                }
+                return raw;
             };
         }
 
@@ -1221,6 +1236,14 @@ ${evidenceDigest}`
                 sources = [],
                 activationReport = {}
             ) {
+                if (instructionProfile?.diagnosticMode) {
+                    return {
+                        passed: true,
+                        reasons: [],
+                        diagnosticMode: true,
+                        adversarialEvidenceAvailable: false
+                    };
+                }
                 const text = String(responseText || '');
                 const lower = safeLower(text);
                 const nonEmptyLines = text.split('\n').map(line => line.trim()).filter(Boolean);
@@ -1733,9 +1756,12 @@ ${evidenceDigest}`
 
         patchMethod(CognitiveRetriever, 'retrieve', (original) => async function patchedRetrieve(query, topK = null, options = {}) {
             if (!this.allChunks?.length) return [];
-            const retrievalQuery = typeof this.superBrainResolveQueryFromSession === 'function'
+            const resolvedQuery = typeof this.superBrainResolveQueryFromSession === 'function'
                 ? this.superBrainResolveQueryFromSession(query)
                 : query;
+            const retrievalQuery = typeof this.superBrainSanitizeRetrievalQuery === 'function'
+                ? this.superBrainSanitizeRetrievalQuery(resolvedQuery)
+                : resolvedQuery;
 
             const baseIntent = options.intent || (typeof this.detectQueryIntent === 'function'
                 ? this.detectQueryIntent(query)
@@ -1882,6 +1908,10 @@ ${evidenceDigest}`
         patchMethod(CognitiveSynthesizer, 'buildUserPrompt', (original) => function patchedBuildUserPrompt(query, instructionProfile = {}) {
             const base = original.call(this, query, instructionProfile);
             const format = instructionProfile?.requestedFormat || 'structured prose';
+            const diagnosticMode = !!instructionProfile?.diagnosticMode;
+            if (diagnosticMode) {
+                return `${base}\n\nDiagnostic mode: The user provided sample output for troubleshooting.\nAnalyze the sample response quality and identify concrete failures (unsupported claims, assumption leakage, citation problems, process/gating errors).\nDo NOT answer the underlying domain question and do NOT mimic the sample's structure as target output.`;
+            }
             const decisionMode = !!instructionProfile?.decisionMode;
             const perspectiveMode = !!instructionProfile?.perspectiveMode;
             const adversarialMode = !!instructionProfile?.adversarialMode || decisionMode;
@@ -1921,6 +1951,7 @@ ${evidenceDigest}`
 
         patchMethod(CognitiveSynthesizer, 'buildInstructionProfile', (original) => function patchedBuildInstructionProfile(query) {
             const profile = original.call(this, query);
+            const diagnosticMode = /\b(example output|for troubleshooting|troubleshoot|debug|not to tailor|what is going on|why (?:is|does).{0,30}(?:output|response))\b/i.test(String(query || ''));
             const decisionMode = /\b(recommend|recommendation|decision|should|best approach|manage|strategy|trade-?off|pros|cons|options?|what should|how to handle|policy approach)\b/i.test(String(query || ''));
             const perspectiveMode = /\b(stakeholder|policy|should we|implement|impact on|conflict|conflicting goals|audience|department|team|user group)\b/i.test(String(query || ''));
             const frameworkMode = /\b(framework|pros|cons|analysis|evaluate|assess|compare|trade-?off|root cause|causal|swot|strength|weakness)\b/i.test(String(query || '')) || decisionMode;
@@ -1933,6 +1964,7 @@ ${evidenceDigest}`
                 executiveSummaryRequired: true,
                 predictiveCodingMode: true,
                 system2AnalyticalMode: true,
+                diagnosticMode,
                 decisionMode,
                 perspectiveMode,
                 frameworkMode,
@@ -1961,6 +1993,18 @@ ${evidenceDigest}`
                 instructionProfile,
                 workingMemorySummary
             );
+            const diagnosticMode = !!instructionProfile?.diagnosticMode;
+            if (diagnosticMode) {
+                const diagnosticRules = [
+                    'DIAGNOSTIC TROUBLESHOOTING MODE (MANDATORY)',
+                    '- The user provided a sample answer/output for debugging.',
+                    '- Analyze why the sample is weak/incorrect (hallucination risk, unsupported claims, citation defects, process violations).',
+                    '- Do not answer the underlying domain task in the sample.',
+                    '- Do not mimic the sample structure as the target output.',
+                    '- Provide concise root-cause analysis and concrete fixes.'
+                ].join('\n');
+                return [base, diagnosticRules].filter(Boolean).join('\n\n');
+            }
 
             const activationBlock = summarizeActivation(corpusStats.activationReport);
             const adversarialEvidenceAvailable = Number(corpusStats?.activationReport?.adversarialChunks || 0) > 0;
@@ -2129,6 +2173,7 @@ ${evidenceDigest}`
                 : false;
             const minCitationTarget = sources.length >= 10 ? MIN_CITATIONS_FOR_RICH_CORPUS : sources.length >= 4 ? 2 : sources.length > 0 ? 1 : 0;
             const profileForChecks = result.meta?.instructionProfile || requestProfile;
+            const diagnosticMode = !!profileForChecks?.diagnosticMode;
             let depthGate = typeof this.superBrainEvaluateCognitiveDepth === 'function'
                 ? this.superBrainEvaluateCognitiveDepth(
                     query,
@@ -2141,11 +2186,13 @@ ${evidenceDigest}`
                 : { passed: true, reasons: [] };
 
             const requiresAdditionalRepair = (
-                citationCount < minCitationTarget ||
-                missingUncertaintySection ||
-                malformedCitationSignals ||
-                (diagnostics && diagnostics.needsRepair) ||
-                !depthGate.passed
+                !diagnosticMode && (
+                    citationCount < minCitationTarget ||
+                    missingUncertaintySection ||
+                    malformedCitationSignals ||
+                    (diagnostics && diagnostics.needsRepair) ||
+                    !depthGate.passed
+                )
             );
 
             if (requiresAdditionalRepair && typeof this.verifyAndRepairAnswer === 'function') {
@@ -2212,7 +2259,7 @@ ${evidenceDigest}`
             }
 
             let depthRepairAttempts = 0;
-            while (!depthGate.passed && depthRepairAttempts < MAX_ANALYSIS_REWRITE_ATTEMPTS && typeof this.verifyAndRepairAnswer === 'function') {
+            while (!diagnosticMode && !depthGate.passed && depthRepairAttempts < MAX_ANALYSIS_REWRITE_ATTEMPTS && typeof this.verifyAndRepairAnswer === 'function') {
                 const ctx = typeof this.formatContext === 'function'
                     ? this.formatContext(sources || [], 13000).contextText
                     : '';
@@ -2262,9 +2309,12 @@ ${evidenceDigest}`
             );
             const severeGapRisk = Array.isArray(model?.gaps) && model.gaps.length >= MODEL_GAP_THRESHOLD;
             const shouldRequestMoreEvidence = completeness.needsMoreEvidence && (
-                sources.length === 0 ||
-                completeness.docCount < completeness.requiredDocs ||
-                (severeGapRisk && completeness.docCount < Math.max(2, completeness.requiredDocs))
+                !diagnosticMode &&
+                (
+                    sources.length === 0 ||
+                    completeness.docCount < completeness.requiredDocs ||
+                    (severeGapRisk && completeness.docCount < Math.max(2, completeness.requiredDocs))
+                )
             );
             if (shouldRequestMoreEvidence) {
                 result.response = this.superBrainBuildMissingEvidenceResponse(query, completeness, sources, model);
