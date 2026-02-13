@@ -668,6 +668,33 @@
                             Strict RAG mode enforces source-grounded reasoning, continuity-safe context use, and citations.
                         </p>
                     </div>
+
+                    <div class="model-section">
+                        <h4 style="font-size:.9rem;color:#0d667d;">World Boundary Controls (Required)</h4>
+                        <input
+                            class="api-input"
+                            id="worldBoundaryInput"
+                            placeholder="Authoritative corpus boundary (e.g., Uploaded policy manuals + current attachments)"
+                            style="margin-bottom:.55rem;"
+                        >
+                        <textarea
+                            class="api-input"
+                            id="priorityRulesInput"
+                            rows="4"
+                            placeholder="Priority rules, one per line (e.g., Specific clause > general clause; Newer version > older version)"
+                            style="font-family:inherit;resize:vertical;margin-bottom:.55rem;"
+                        ></textarea>
+                        <select class="model-select" id="taskFrameSelect" style="margin-bottom:.55rem;">
+                            <option value="explain">Task frame: Explain</option>
+                            <option value="compute">Task frame: Compute</option>
+                            <option value="decide">Task frame: Decide</option>
+                            <option value="troubleshoot">Task frame: Troubleshoot</option>
+                        </select>
+                        <button class="api-save-btn" id="saveWorldSettings">Save World Settings</button>
+                        <p style="margin-top:.45rem;color:#516377;font-size:.76rem;">
+                            Queries are blocked until authoritative scope is defined. This enforces no-hallucination world constraints.
+                        </p>
+                    </div>
                 </div>
 
                 <div class="upload-zone" id="uploadZone">
@@ -737,6 +764,8 @@
     const MODEL_FALLBACK_ORDER = ['gpt-4.1', 'gpt-4o', 'gpt-4o-mini'];
     const INLINE_SUPER_BRAIN_ENHANCER_STORAGE_KEY = 'enable_inline_super_brain_enhancer';
     const INLINE_SUPER_BRAIN_ENHANCER_DEFAULT = false;
+    const WORLD_SETTINGS_STORAGE_KEY = 'cognition_world_settings_v1';
+    const WORLD_SETTINGS_DEFINED_KEY = 'cognition_world_settings_defined_v1';
     const RETRIEVER_STOP_WORDS = new Set([
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be',
@@ -1278,6 +1307,10 @@
             this.embeddingEnabled = true;
             this.lastEmbeddingError = '';
             this.stopWords = RETRIEVER_STOP_WORDS;
+            this.coarseDocumentIndex = [];
+            this.knowledgeNetwork = null;
+            this.lastKnowledgeGraphStats = { concepts: 0, statements: 0, edges: 0, ambiguousAliases: 0 };
+            this.lastWorkingMemoryState = null;
         }
 
         setEmbeddingApiKey(apiKey) { this.embeddingApiKey = apiKey || ''; }
@@ -1407,6 +1440,7 @@
             this.chunkEmbeddingTextCache.clear();
             this.buildTokenStats();
             this.buildConceptIndex();
+            this.buildProgressiveKnowledgeNetwork();
         }
 
         deriveMemoryFromChunks(doc) {
@@ -1746,7 +1780,11 @@
             const linkedChunks = this.findConceptLinkedChunks(primaryResults, query, baseFeatures.queryTokens, baseFeatures.queryConcepts)
                 .slice(0, Math.max(2, Math.floor(topK * 0.25)));
             const merged = this.mergeUniqueChunks(primaryResults, linkedChunks, candidatePoolLimit);
-            if (merged.length === 0) return this.allChunks.slice(0, topK);
+            if (merged.length === 0) {
+                const fallback = this.allChunks.slice(0, topK);
+                this.lastWorkingMemoryState = this.activateWorkingKnowledgeSubgraph(query, fallback, { intent });
+                return fallback;
+            }
 
             const rerankCandidates = this.mergeUniqueChunks(
                 scoredChunks.slice(0, Math.max(topK * 8, 80)),
@@ -1754,15 +1792,17 @@
                 EMBEDDING_RERANK_CANDIDATE_LIMIT
             );
 
+            let finalResults = merged.slice(0, topK);
             if (this.shouldUseSemanticRerank(intent, rerankCandidates, topK)) {
                 const semanticResults = await this.semanticRerank(query, rerankCandidates, topK, intent);
                 if (semanticResults && semanticResults.length > 0) {
                     const lexicalHead = merged.slice(0, Math.ceil(topK * 0.5));
                     const semanticHead = semanticResults.slice(0, Math.ceil(topK * 0.7));
-                    return this.mergeUniqueChunks(lexicalHead, semanticHead, topK);
+                    finalResults = this.mergeUniqueChunks(lexicalHead, semanticHead, topK);
                 }
             }
-            return merged.slice(0, topK);
+            this.lastWorkingMemoryState = this.activateWorkingKnowledgeSubgraph(query, finalResults, { intent });
+            return finalResults;
         }
 
         calculateLocalRelevanceScore(chunk, queryTokens, queryEntities, queryConcepts) {
@@ -1867,6 +1907,445 @@
                 const sentence = this.extractBestSentence(chunk.text, queryTokens);
                 return `${idx + 1}. [${chunk.filename}${pagePart}] ${sentence}`;
             }).join('\n');
+        }
+
+        normalizeConceptKey(raw) {
+            const normalized = String(raw || '')
+                .toLowerCase()
+                .replace(/[^\w\s-]/g, ' ')
+                .replace(/\b(the|a|an)\b/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!normalized) return '';
+            if (normalized.endsWith('s') && normalized.length > 4 && !normalized.endsWith('ss')) {
+                return normalized.slice(0, -1);
+            }
+            return normalized;
+        }
+
+        inferTypedRelation(sentenceLower) {
+            const value = String(sentenceLower || '');
+            if (!value) return 'depends-on';
+            if (/\b(is defined as|refers to|means|defined by|definition of)\b/.test(value)) return 'defines';
+            if (/\b(prerequisite|precondition|required before|must first)\b/.test(value)) return 'prerequisite-for';
+            if (/\b(depends on|requires|contingent on|based on)\b/.test(value)) return 'depends-on';
+            if (/\b(causes?|leads to|results? in|drives?|therefore)\b/.test(value)) return 'causes';
+            if (/\b(part of|component of|belongs to|subset of)\b/.test(value)) return 'part-of';
+            if (/\b(for example|such as|e\.g\.)\b/.test(value)) return 'example-of';
+            if (/\b(contradict|in conflict|inconsistent|opposes)\b/.test(value)) return 'contradicts';
+            if (/\b(except|unless|override|supersede|only when|however)\b/.test(value)) return 'exception-to';
+            return 'depends-on';
+        }
+
+        extractScopeMetadata(sentence) {
+            const text = String(sentence || '').replace(/\s+/g, ' ').trim();
+            if (!text) return [];
+            const tags = [];
+            const patterns = [
+                /\b(if|when)\s+([^.;:]{4,80})/gi,
+                /\b(unless|except)\s+([^.;:]{4,80})/gi,
+                /\bonly\s+for\s+([^.;:]{3,60})/gi,
+                /\bin\s+(?:jurisdiction|region|country|state)\s+([^.;:]{2,40})/gi,
+                /\beffective\s+(?:from|as of)\s+([^.;:]{3,40})/gi
+            ];
+            for (const pattern of patterns) {
+                let match;
+                while ((match = pattern.exec(text)) !== null) {
+                    const value = `${match[1]} ${match[2] || ''}`.replace(/\s+/g, ' ').trim();
+                    if (value.length >= 4) tags.push(value);
+                    if (tags.length >= 6) break;
+                }
+                if (tags.length >= 6) break;
+            }
+            return Array.from(new Set(tags)).slice(0, 6);
+        }
+
+        extractVersionMetadata(chunk, sentence = '') {
+            const context = `${String(chunk?.filename || '')} ${String(sentence || '')}`;
+            const version = context.match(/\b(?:v|version)\s*([0-9]+(?:\.[0-9]+){0,2})\b/i);
+            const yearMatches = context.match(/\b(19|20)\d{2}\b/g) || [];
+            const years = yearMatches.map(item => parseInt(item, 10)).filter(Number.isFinite);
+            const latestYear = years.length ? Math.max(...years) : null;
+            if (version && latestYear) return `v${version[1]} (${latestYear})`;
+            if (version) return `v${version[1]}`;
+            if (latestYear) return `${latestYear}`;
+            return '';
+        }
+
+        extractAtomicStatementsFromChunk(chunk, maxPerChunk = 10) {
+            const text = String(chunk?.text || '');
+            if (!text) return [];
+            const statements = [];
+            const sentences = text
+                .split(/(?<=[.!?])\s+/)
+                .map(item => item.replace(/\s+/g, ' ').trim())
+                .filter(Boolean);
+            for (let idx = 0; idx < sentences.length; idx++) {
+                if (statements.length >= maxPerChunk) break;
+                const sentence = sentences[idx];
+                if (sentence.length < 34 || sentence.length > 360) continue;
+                const lower = sentence.toLowerCase();
+                const relationType = this.inferTypedRelation(lower);
+                const statementType = /\b(must|required|cannot|prohibited|only|ineligible|restricted)\b/.test(lower)
+                    ? 'constraint'
+                    : relationType === 'contradicts'
+                        ? 'counterevidence'
+                        : relationType === 'causes'
+                            ? 'causal'
+                            : relationType === 'defines'
+                                ? 'definition'
+                                : 'support';
+                const conceptCandidates = Array.from(new Set([
+                    ...this.extractKeyConceptsFromChunk(sentence),
+                    ...(this.extractConcepts(sentence) || []).slice(0, 4).map(item => this.normalizeConceptKey(item))
+                ].map(item => this.normalizeConceptKey(item)).filter(item => item.length >= 3))).slice(0, 6);
+                if (!conceptCandidates.length) continue;
+                const quote = sentence.slice(0, 110).replace(/"/g, '\'');
+                const statementId = `${chunk?.id || `${chunk?.filename || 'doc'}:${chunk?.index || 0}`}:stmt:${idx}`;
+                statements.push({
+                    id: statementId,
+                    text: sentence.slice(0, 320),
+                    type: statementType,
+                    relationType,
+                    concepts: conceptCandidates,
+                    provenance: {
+                        filename: chunk?.filename || 'Unknown',
+                        page: chunk?.page || 'N/A',
+                        section: chunk?.section || 'Document',
+                        chunkId: chunk?.id || null,
+                        chunkIndex: chunk?.index || 0,
+                        sentenceIndex: idx,
+                        versionTag: this.extractVersionMetadata(chunk, sentence),
+                        scopeTags: this.extractScopeMetadata(sentence)
+                    },
+                    citation: `[Source: ${chunk?.filename || 'Unknown'}, page ${chunk?.page || 'N/A'}, "${quote || 'relevant quote'}"]`
+                });
+            }
+            return statements;
+        }
+
+        buildCoarseDocumentIndex() {
+            return (this.documents || []).map(doc => ({
+                filename: doc.filename,
+                headings: Array.isArray(doc?.memory?.outline) ? doc.memory.outline.slice(0, 20) : [],
+                keyTerms: Array.isArray(doc?.memory?.keyConcepts) ? doc.memory.keyConcepts.slice(0, 24) : [],
+                chunkCount: (doc?.chunks || []).length
+            }));
+        }
+
+        buildDeepKnowledgeGraph(maxStatements = 5200) {
+            const conceptRegistry = new Map();
+            const aliasToConcept = new Map();
+            const ambiguousAliases = new Map();
+            const statementRegistry = new Map();
+            const statementsByConcept = new Map();
+            const conceptEdges = new Map();
+            const conceptsByChunk = new Map();
+
+            const ensureConcept = (rawConcept, statement = null) => {
+                const conceptId = this.normalizeConceptKey(rawConcept);
+                if (!conceptId) return '';
+                if (!conceptRegistry.has(conceptId)) {
+                    conceptRegistry.set(conceptId, {
+                        id: conceptId,
+                        label: conceptId,
+                        aliases: new Set(),
+                        symbols: new Set(),
+                        disambiguation: new Set(),
+                        statementIds: new Set()
+                    });
+                }
+                const entry = conceptRegistry.get(conceptId);
+                const alias = this.normalizeConceptKey(rawConcept);
+                if (alias) {
+                    if (aliasToConcept.has(alias) && aliasToConcept.get(alias) !== conceptId) {
+                        if (!ambiguousAliases.has(alias)) {
+                            ambiguousAliases.set(alias, new Set([aliasToConcept.get(alias)]));
+                        }
+                        ambiguousAliases.get(alias).add(conceptId);
+                    } else {
+                        aliasToConcept.set(alias, conceptId);
+                    }
+                    entry.aliases.add(alias);
+                }
+                if (/^[A-Z0-9-]{2,8}$/.test(String(rawConcept || ''))) entry.symbols.add(String(rawConcept).trim());
+                if (statement?.provenance?.section) entry.disambiguation.add(`section: ${statement.provenance.section}`);
+                return conceptId;
+            };
+
+            const addEdge = (fromId, toId, relationType, statementId, weight = 1) => {
+                if (!fromId || !toId || fromId === toId) return;
+                if (!conceptEdges.has(fromId)) conceptEdges.set(fromId, new Map());
+                const neighbors = conceptEdges.get(fromId);
+                if (!neighbors.has(toId)) neighbors.set(toId, { weight: 0, types: new Set(), statementIds: new Set() });
+                const edge = neighbors.get(toId);
+                edge.weight += Math.max(0.05, Number(weight) || 0.1);
+                edge.types.add(relationType || 'depends-on');
+                if (statementId) edge.statementIds.add(statementId);
+            };
+
+            for (const chunk of (this.allChunks || [])) {
+                if (statementRegistry.size >= maxStatements) break;
+                const statements = this.extractAtomicStatementsFromChunk(chunk, 12);
+                if (!statements.length) continue;
+                const chunkKey = chunk?.id || `${chunk?.filename || 'doc'}:${chunk?.index || 0}`;
+                const chunkConceptSet = new Set();
+                for (const statement of statements) {
+                    if (statementRegistry.size >= maxStatements) break;
+                    statementRegistry.set(statement.id, statement);
+                    const conceptIds = [];
+                    for (const concept of statement.concepts || []) {
+                        const conceptId = ensureConcept(concept, statement);
+                        if (!conceptId) continue;
+                        conceptIds.push(conceptId);
+                        chunkConceptSet.add(conceptId);
+                        if (!statementsByConcept.has(conceptId)) statementsByConcept.set(conceptId, new Set());
+                        statementsByConcept.get(conceptId).add(statement.id);
+                        conceptRegistry.get(conceptId).statementIds.add(statement.id);
+                    }
+                    for (let i = 0; i < conceptIds.length; i++) {
+                        for (let j = i + 1; j < conceptIds.length; j++) {
+                            const relationType = statement.relationType || 'depends-on';
+                            const relationWeight = relationType === 'contradicts'
+                                ? 0.7
+                                : relationType === 'exception-to'
+                                    ? 0.88
+                                    : 1;
+                            addEdge(conceptIds[i], conceptIds[j], relationType, statement.id, relationWeight);
+                            addEdge(conceptIds[j], conceptIds[i], relationType, statement.id, relationWeight * 0.96);
+                        }
+                    }
+                }
+                if (chunkConceptSet.size) conceptsByChunk.set(chunkKey, chunkConceptSet);
+            }
+
+            for (const [alias, conceptIds] of ambiguousAliases.entries()) {
+                for (const conceptId of conceptIds) {
+                    if (!conceptRegistry.has(conceptId)) continue;
+                    conceptRegistry.get(conceptId).disambiguation.add(`Alias "${alias}" is ambiguous across ${conceptIds.size} concepts`);
+                }
+                aliasToConcept.delete(alias);
+            }
+
+            return {
+                conceptRegistry,
+                aliasToConcept,
+                ambiguousAliases,
+                statementRegistry,
+                statementsByConcept,
+                conceptEdges,
+                conceptsByChunk
+            };
+        }
+
+        refineKnowledgeGraph(network) {
+            if (!network) return null;
+            const seenStatements = new Map();
+            for (const [statementId, statement] of network.statementRegistry.entries()) {
+                const key = String(statement?.text || '').toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+                if (!key) continue;
+                if (!seenStatements.has(key)) {
+                    seenStatements.set(key, statementId);
+                    continue;
+                }
+                const existingId = seenStatements.get(key);
+                const existing = network.statementRegistry.get(existingId);
+                const existingDoc = String(existing?.provenance?.filename || '');
+                const currentDoc = String(statement?.provenance?.filename || '');
+                const existingVersion = parseInt(String(existing?.provenance?.versionTag || '').match(/\b(19|20)\d{2}\b/)?.[0] || '0', 10);
+                const currentVersion = parseInt(String(statement?.provenance?.versionTag || '').match(/\b(19|20)\d{2}\b/)?.[0] || '0', 10);
+                const preferCurrent = currentVersion > existingVersion;
+                if (preferCurrent) {
+                    network.statementRegistry.delete(existingId);
+                    seenStatements.set(key, statementId);
+                } else {
+                    network.statementRegistry.delete(statementId);
+                }
+                if (existingDoc && currentDoc && existingDoc !== currentDoc) {
+                    const concept = (statement?.concepts || [])[0] || '';
+                    if (concept && network.conceptRegistry.has(concept)) {
+                        network.conceptRegistry.get(concept).disambiguation.add(`Cross-document duplicate/variant detected between ${existingDoc} and ${currentDoc}`);
+                    }
+                }
+            }
+            return network;
+        }
+
+        buildProgressiveKnowledgeNetwork() {
+            this.coarseDocumentIndex = this.buildCoarseDocumentIndex();
+            const deepGraph = this.buildDeepKnowledgeGraph(5200);
+            this.knowledgeNetwork = this.refineKnowledgeGraph(deepGraph);
+            const edgeCount = Array.from(this.knowledgeNetwork?.conceptEdges?.values() || [])
+                .reduce((sum, neighbors) => sum + neighbors.size, 0);
+            this.lastKnowledgeGraphStats = {
+                concepts: this.knowledgeNetwork?.conceptRegistry?.size || 0,
+                statements: this.knowledgeNetwork?.statementRegistry?.size || 0,
+                edges: edgeCount,
+                ambiguousAliases: this.knowledgeNetwork?.ambiguousAliases?.size || 0
+            };
+            return this.knowledgeNetwork;
+        }
+
+        resolveSeedConcepts(query, seedChunks = []) {
+            const graph = this.knowledgeNetwork;
+            if (!graph?.conceptRegistry?.size) return [];
+            const seeds = [];
+            const addSeed = (conceptId, score, origin) => {
+                if (!conceptId || !graph.conceptRegistry.has(conceptId)) return;
+                seeds.push({ conceptId, score: Math.max(0.08, score || 0), origin });
+            };
+            const queryConcepts = [
+                ...(this.extractConcepts(query) || []).slice(0, 8),
+                ...((this.extractEntities(query) || []).slice(0, 6))
+            ];
+            for (const concept of queryConcepts) {
+                const normalized = this.normalizeConceptKey(concept);
+                const conceptId = graph.conceptRegistry.has(normalized)
+                    ? normalized
+                    : (graph.aliasToConcept.get(normalized) || '');
+                if (conceptId) addSeed(conceptId, 1, 'query');
+            }
+            for (const chunk of (seedChunks || [])) {
+                const chunkKey = chunk?.id || `${chunk?.filename || 'doc'}:${chunk?.index || 0}`;
+                const conceptSet = graph.conceptsByChunk.get(chunkKey);
+                if (!conceptSet) continue;
+                const baseScore = 0.62 + Math.min(0.35, Number(chunk?.score || 0));
+                for (const conceptId of conceptSet) addSeed(conceptId, baseScore, 'seed-chunk');
+            }
+            const bestByConcept = new Map();
+            for (const seed of seeds) {
+                const current = bestByConcept.get(seed.conceptId);
+                if (!current || seed.score > current.score) bestByConcept.set(seed.conceptId, seed);
+            }
+            return Array.from(bestByConcept.values()).sort((a, b) => b.score - a.score).slice(0, 24);
+        }
+
+        activateWorkingKnowledgeSubgraph(query, selectedChunks = [], options = {}) {
+            if (!this.knowledgeNetwork?.statementRegistry?.size) {
+                this.buildProgressiveKnowledgeNetwork();
+            }
+            const graph = this.knowledgeNetwork;
+            if (!graph?.statementRegistry?.size) {
+                return {
+                    query,
+                    activatedConcepts: [],
+                    activatedStatements: [],
+                    docDiversity: 0,
+                    evidenceSufficient: false,
+                    activationCoveragePct: 0
+                };
+            }
+
+            const maxHops = Number.isFinite(options.maxHops) ? options.maxHops : 3;
+            const decay = Number.isFinite(options.decay) ? options.decay : 0.72;
+            const minScore = Number.isFinite(options.minScore) ? options.minScore : 0.12;
+            const maxStatements = Number.isFinite(options.maxStatements) ? options.maxStatements : 96;
+            const seeds = this.resolveSeedConcepts(query, selectedChunks);
+            if (!seeds.length) {
+                return {
+                    query,
+                    activatedConcepts: [],
+                    activatedStatements: [],
+                    docDiversity: 0,
+                    evidenceSufficient: false,
+                    activationCoveragePct: 0
+                };
+            }
+
+            const conceptScores = new Map();
+            const statementScores = new Map();
+            const docCounter = new Map();
+            let frontier = seeds.map(seed => ({ ...seed, hop: 0 }));
+            let hop = 0;
+
+            while (frontier.length && hop <= maxHops && statementScores.size < maxStatements) {
+                const nextFrontier = [];
+                const rankedFrontier = frontier.slice().sort((a, b) => b.score - a.score).slice(0, 42);
+                for (const node of rankedFrontier) {
+                    if (node.score < minScore) continue;
+                    const priorConceptScore = conceptScores.get(node.conceptId) || 0;
+                    if (node.score <= priorConceptScore * 0.97) continue;
+                    conceptScores.set(node.conceptId, node.score);
+
+                    const statementIds = Array.from(graph.statementsByConcept.get(node.conceptId) || []).slice(0, 16);
+                    for (const statementId of statementIds) {
+                        if (statementScores.size >= maxStatements) break;
+                        const statement = graph.statementRegistry.get(statementId);
+                        if (!statement) continue;
+                        const docName = String(statement?.provenance?.filename || 'unknown');
+                        const docPenalty = 1 / (1 + (docCounter.get(docName) || 0) * 0.4);
+                        const relationBoost = (statement.relationType === 'exception-to' || statement.relationType === 'contradicts') ? 1.08 : 1;
+                        const statementScore = node.score * docPenalty * relationBoost;
+                        if (statementScore < minScore * 0.75) continue;
+                        if ((statementScores.get(statementId) || 0) >= statementScore) continue;
+                        statementScores.set(statementId, statementScore);
+                        docCounter.set(docName, (docCounter.get(docName) || 0) + 1);
+                    }
+
+                    const neighbors = graph.conceptEdges.get(node.conceptId);
+                    if (neighbors) {
+                        const rankedNeighbors = Array.from(neighbors.entries())
+                            .sort((a, b) => b[1].weight - a[1].weight)
+                            .slice(0, 8);
+                        for (const [neighborId, edge] of rankedNeighbors) {
+                            const typeBoost = edge.types?.has('exception-to') || edge.types?.has('prerequisite-for')
+                                ? 1.06
+                                : edge.types?.has('contradicts')
+                                    ? 0.96
+                                    : 1;
+                            const nextScore = node.score * decay * Math.min(1.35, edge.weight) * typeBoost;
+                            if (nextScore < minScore) continue;
+                            if (nextScore <= (conceptScores.get(neighborId) || 0) * 0.97) continue;
+                            nextFrontier.push({ conceptId: neighborId, score: nextScore, hop: node.hop + 1, origin: node.conceptId });
+                        }
+                    }
+                }
+                frontier = Array.from(new Map(
+                    nextFrontier
+                        .sort((a, b) => b.score - a.score)
+                        .map(item => [item.conceptId, item])
+                ).values()).slice(0, 42);
+                hop += 1;
+            }
+
+            const activatedConcepts = Array.from(conceptScores.entries())
+                .map(([conceptId, score]) => {
+                    const entry = graph.conceptRegistry.get(conceptId);
+                    return {
+                        conceptId,
+                        label: entry?.label || conceptId,
+                        aliases: Array.from(entry?.aliases || []).slice(0, 5),
+                        disambiguation: Array.from(entry?.disambiguation || []).slice(0, 3),
+                        score
+                    };
+                })
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 44);
+            const activatedStatements = Array.from(statementScores.entries())
+                .map(([statementId, score]) => {
+                    const statement = graph.statementRegistry.get(statementId);
+                    return statement ? { ...statement, score } : null;
+                })
+                .filter(Boolean)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, maxStatements);
+            const docDiversity = new Set(activatedStatements.map(item => String(item?.provenance?.filename || '')).filter(Boolean)).size;
+            const requiredDocs = /\b(overall|across|entire|comprehensive|compare|contrast|trade-?off|decision|recommend)\b/i.test(String(query || '')) ? 2 : 1;
+            const evidenceSufficient = activatedStatements.length >= 10 && docDiversity >= requiredDocs;
+            const activationCoveragePct = this.documents.length
+                ? Math.round((docDiversity / Math.max(1, this.documents.length)) * 100)
+                : 0;
+            return {
+                query,
+                totalConcepts: graph.conceptRegistry.size,
+                totalStatements: graph.statementRegistry.size,
+                activatedConcepts,
+                activatedStatements,
+                docDiversity,
+                evidenceSufficient,
+                activationCoveragePct,
+                maxHopsReached: hop
+            };
         }
 
         getTopConnectedConcepts(limit = 10) {
@@ -2778,6 +3257,378 @@ ${answer}`
             };
         }
 
+        buildWorldBoundaryProfile(query, sources = [], corpusStats = {}, instructionProfile = {}) {
+            const settings = corpusStats?.worldSettings || {};
+            const configuredBoundary = String(settings.corpusBoundary || '').trim();
+            const configuredPriority = String(settings.priorityRules || '').trim();
+            const configuredTask = String(settings.taskFrame || '').trim();
+            const docsInScope = Array.from(new Set((sources || []).map(item => String(item?.filename || '').trim()).filter(Boolean)));
+            const inferredTask = /\b(compute|calculate|equation|formula)\b/i.test(query)
+                ? 'compute'
+                : /\b(decide|recommend|should|trade-?off|choose)\b/i.test(query)
+                    ? 'decide'
+                    : /\b(troubleshoot|diagnose|debug|root cause)\b/i.test(query)
+                        ? 'troubleshoot'
+                        : 'explain';
+            const priorityRules = configuredPriority
+                ? configuredPriority.split(/\n+/).map(item => item.trim()).filter(Boolean)
+                : [
+                    'Specific scope clause overrides generic guidance.',
+                    'When versions conflict, newer edition/date supersedes older.',
+                    'If conflict remains unresolved, abstain and request user precedence.'
+                ];
+            return {
+                isDefined: configuredBoundary.length > 0,
+                corpusBoundary: configuredBoundary || 'UNDEFINED',
+                priorityRules: priorityRules.slice(0, 8),
+                taskFrame: ['explain', 'compute', 'decide', 'troubleshoot'].includes(configuredTask) ? configuredTask : inferredTask,
+                strictSourceOnly: true,
+                docsInScope: docsInScope.slice(0, 24),
+                requestedFormat: instructionProfile?.requestedFormat || 'structured prose'
+            };
+        }
+
+        formatWorldBoundaryBlock(profile = null) {
+            if (!profile || typeof profile !== 'object') return '';
+            const lines = [
+                '## WORLD BOUNDARY',
+                `- Corpus boundary: ${profile.corpusBoundary || 'UNDEFINED'}`,
+                `- Task frame: ${profile.taskFrame || 'explain'}`,
+                '- Priority rules:'
+            ];
+            for (const rule of (profile.priorityRules || []).slice(0, 8)) lines.push(`- ${rule}`);
+            if (Array.isArray(profile.docsInScope) && profile.docsInScope.length) {
+                lines.push('- Documents in current scope:');
+                for (const doc of profile.docsInScope.slice(0, 12)) lines.push(`- ${doc}`);
+            }
+            return lines.join('\n');
+        }
+
+        buildEvidenceMapFromWorkingState(workingState = null, maxItems = 12) {
+            if (!workingState || !Array.isArray(workingState.activatedStatements) || workingState.activatedStatements.length === 0) {
+                return { lines: ['- No activated statement graph available.'], statementIds: [] };
+            }
+            const lines = [
+                `- Activated concepts: ${workingState.activatedConcepts?.length || 0}`,
+                `- Activated statements: ${workingState.activatedStatements?.length || 0}`,
+                `- Document diversity: ${workingState.docDiversity || 0}`,
+                `- Evidence sufficiency: ${workingState.evidenceSufficient ? 'sufficient' : 'insufficient'}`
+            ];
+            const statementIds = [];
+            for (const statement of (workingState.activatedStatements || []).slice(0, maxItems)) {
+                const citation = statement.citation || `[Source: ${statement?.provenance?.filename || 'Unknown'}, page ${statement?.provenance?.page || 'N/A'}, "relevant quote"]`;
+                lines.push(`- (${statement.relationType || statement.type || 'support'}) ${String(statement.text || '').slice(0, 220)} ${citation}`);
+                statementIds.push(statement.id);
+            }
+            return { lines, statementIds };
+        }
+
+        buildMentalModelFromWorkingState(query, workingState = null, sources = []) {
+            const statements = Array.isArray(workingState?.activatedStatements)
+                ? workingState.activatedStatements
+                : [];
+            const knowns = statements
+                .filter(item => !/\b(may|might|uncertain|unknown)\b/i.test(String(item?.text || '')))
+                .slice(0, 10)
+                .map(item => `${item.text} ${item.citation || ''}`);
+            const constraints = statements
+                .filter(item => item?.type === 'constraint' || /\b(must|required|cannot|only|prohibited|restricted)\b/i.test(String(item?.text || '')))
+                .slice(0, 8)
+                .map(item => `${item.text} ${item.citation || ''}`);
+            const exceptions = statements
+                .filter(item => item?.relationType === 'exception-to' || item?.relationType === 'contradicts' || /\b(except|unless|however|contradict|override)\b/i.test(String(item?.text || '')))
+                .slice(0, 8)
+                .map(item => `${item.text} ${item.citation || ''}`);
+            const queryTokens = this.tokenizeForDiagnostics(query);
+            const evidenceTokens = new Set(this.tokenizeForDiagnostics(statements.map(item => item?.text || '').join(' ')));
+            const unknowns = queryTokens.filter(token => !evidenceTokens.has(token)).slice(0, 8).map(token => `Missing direct evidence for concept: "${token}"`);
+            const variables = /\b(compute|calculate|formula|equation|percent|rate|ratio)\b/i.test(query)
+                ? ['variables', 'known values', 'unknown values', 'constraints']
+                : /\b(decide|recommend|policy|legal|eligib|criteria)\b/i.test(query)
+                    ? ['criteria', 'facts', 'exceptions', 'decision outcomes']
+                    : /\b(troubleshoot|diagnose|debug|error|failure)\b/i.test(query)
+                        ? ['symptoms', 'candidate causes', 'tests', 'interventions']
+                        : ['entities', 'relationships', 'constraints', 'open questions'];
+            const concepts = Array.isArray(workingState?.activatedConcepts)
+                ? workingState.activatedConcepts.slice(0, 16).map(item => item.label || item.conceptId)
+                : [];
+            return { query, variables, knowns, constraints, exceptions, unknowns, concepts };
+        }
+
+        buildReasoningLedger(query, mentalModel = null, workingState = null, sources = []) {
+            const statements = Array.isArray(workingState?.activatedStatements)
+                ? workingState.activatedStatements.slice(0, 28)
+                : [];
+            const support = statements.filter(item => item?.type !== 'counterevidence' && item?.relationType !== 'contradicts').slice(0, 8);
+            const constraints = statements.filter(item => item?.type === 'constraint').slice(0, 6);
+            const counter = statements.filter(item => item?.relationType === 'exception-to' || item?.relationType === 'contradicts' || item?.type === 'counterevidence').slice(0, 6);
+            const uniqueDocs = new Set(statements.map(item => String(item?.provenance?.filename || '')).filter(Boolean));
+            const steps = [];
+            const selectedInputs = [...support.slice(0, 4), ...constraints.slice(0, 3), ...counter.slice(0, 2)];
+            steps.push({
+                id: 'L1',
+                transformation: 'evidence-selection',
+                inputStatementIds: selectedInputs.map(item => item.id),
+                resultingStatement: `Selected ${selectedInputs.length} high-relevance atomic statements from ${uniqueDocs.size} documents.`,
+                citations: selectedInputs.map(item => item.citation).slice(0, 6)
+            });
+            if (constraints.length) {
+                steps.push({
+                    id: 'L2',
+                    transformation: 'constraint-application',
+                    inputStatementIds: constraints.map(item => item.id),
+                    resultingStatement: `Applied mandatory constraints to prune inadmissible conclusions.`,
+                    citations: constraints.map(item => item.citation).slice(0, 6)
+                });
+            }
+            if (counter.length) {
+                steps.push({
+                    id: `L${steps.length + 1}`,
+                    transformation: 'counterexample-search',
+                    inputStatementIds: counter.map(item => item.id),
+                    resultingStatement: `Integrated conflicting and exception evidence before finalizing conclusion scope.`,
+                    citations: counter.map(item => item.citation).slice(0, 6)
+                });
+            }
+            const finalInputs = [...support.slice(0, 5), ...constraints.slice(0, 4), ...counter.slice(0, 3)];
+            const confidenceLabel = support.length >= 4 && uniqueDocs.size >= 2
+                ? (counter.length > Math.ceil(support.length * 0.8) ? 'Partially supported' : 'Supported')
+                : 'Insufficient evidence';
+            steps.push({
+                id: `L${steps.length + 1}`,
+                transformation: 'rule-chaining-and-conclusion',
+                inputStatementIds: finalInputs.map(item => item.id),
+                resultingStatement: confidenceLabel === 'Insufficient evidence'
+                    ? 'Evidence is insufficient for a complete conclusion under current corpus constraints.'
+                    : 'Final conclusion follows from stated claims plus permitted transformations.',
+                citations: finalInputs.map(item => item.citation).slice(0, 8)
+            });
+            const admissibleClaims = [
+                ...statements.map(item => String(item?.text || '').trim()),
+                ...steps.map(step => String(step.resultingStatement || '').trim()),
+                ...((mentalModel?.constraints || []).map(item => String(item || '').trim()))
+            ].filter(Boolean);
+            return {
+                query,
+                steps,
+                confidenceLabel,
+                documentCount: uniqueDocs.size,
+                admissibleClaims: Array.from(new Set(admissibleClaims))
+            };
+        }
+
+        runConsistencyAndSanityChecks(workingState = null, mentalModel = null) {
+            const statements = Array.isArray(workingState?.activatedStatements) ? workingState.activatedStatements : [];
+            const issues = [];
+            const restrictive = statements.filter(item => /\b(must|required|cannot|prohibited|only)\b/i.test(String(item?.text || '')));
+            const permissive = statements.filter(item => /\b(may|can|allowed|eligible|unless)\b/i.test(String(item?.text || '')));
+            if (restrictive.length && permissive.length) {
+                const overlap = restrictive.some(a => permissive.some(b => {
+                    const tokA = this.tokenizeForDiagnostics(a?.text || '');
+                    const tokB = new Set(this.tokenizeForDiagnostics(b?.text || ''));
+                    const matches = tokA.filter(token => tokB.has(token)).length;
+                    return matches >= 4;
+                }));
+                if (overlap) issues.push('Potential contradiction detected between restrictive and permissive statements.');
+            }
+            const unitPattern = /\b\d+(\.\d+)?\s*(kg|g|mg|km|m|cm|mm|%|percent|hours?|days?|weeks?|months?|years?)\b/gi;
+            const unitMentions = (statements.map(item => item?.text || '').join(' ').match(unitPattern) || []).map(item => item.toLowerCase());
+            if (unitMentions.length >= 2) {
+                const unitFamilies = new Set(unitMentions.map(item => item.replace(/[\d.\s]/g, '')));
+                if (unitFamilies.size >= 4) issues.push('Sanity check: multiple unit families detected; verify conversions/boundaries.');
+            }
+            if (Array.isArray(mentalModel?.unknowns) && mentalModel.unknowns.length >= 4) {
+                issues.push('High unresolved unknown set; final recommendation should be conservative or abstain.');
+            }
+            return {
+                passed: issues.length === 0,
+                issues
+            };
+        }
+
+        parseYearFromVersion(value = '') {
+            const match = String(value || '').match(/\b(19|20)\d{2}\b/);
+            return match ? parseInt(match[0], 10) : null;
+        }
+
+        buildConflictVersionReport(workingState = null) {
+            const statements = Array.isArray(workingState?.activatedStatements) ? workingState.activatedStatements : [];
+            const restrictiveRegex = /\b(must|required|cannot|prohibited|restricted|only)\b/i;
+            const permissiveRegex = /\b(may|can|allowed|eligible|unless|either|option)\b/i;
+            const grouped = new Map();
+            for (const statement of statements) {
+                const conceptKey = Array.isArray(statement?.concepts) && statement.concepts.length
+                    ? String(statement.concepts[0])
+                    : this.normalizeFilename(String(statement?.provenance?.filename || '') + ':' + String(statement?.provenance?.section || ''));
+                if (!conceptKey) continue;
+                if (!grouped.has(conceptKey)) grouped.set(conceptKey, []);
+                grouped.get(conceptKey).push(statement);
+            }
+            const conflicts = [];
+            for (const [concept, group] of grouped.entries()) {
+                const restrictive = group.filter(item => restrictiveRegex.test(String(item?.text || '')));
+                const permissive = group.filter(item => permissiveRegex.test(String(item?.text || '')));
+                if (!restrictive.length || !permissive.length) continue;
+                const a = restrictive[0];
+                const b = permissive[0];
+                const yearA = this.parseYearFromVersion(a?.provenance?.versionTag || '');
+                const yearB = this.parseYearFromVersion(b?.provenance?.versionTag || '');
+                const scopeA = (a?.provenance?.scopeTags || []).length;
+                const scopeB = (b?.provenance?.scopeTags || []).length;
+                let selected = 'unresolved';
+                let selectionRule = 'No source-defined precedence found; user choice required.';
+                if (yearA && yearB && yearA !== yearB) {
+                    selected = yearA > yearB ? 'restrictive' : 'permissive';
+                    selectionRule = `Selected ${selected} due to newer version/date (${Math.max(yearA, yearB)}).`;
+                } else if (scopeA !== scopeB) {
+                    selected = scopeA > scopeB ? 'restrictive' : 'permissive';
+                    selectionRule = `Selected ${selected} due to more specific scope conditions.`;
+                }
+                conflicts.push({
+                    concept,
+                    restrictive: a,
+                    permissive: b,
+                    selected,
+                    selectionRule
+                });
+            }
+            return {
+                conflicts: conflicts.slice(0, 8),
+                unresolvedCount: conflicts.filter(item => item.selected === 'unresolved').length
+            };
+        }
+
+        formatConflictVersionReport(report = null) {
+            if (!report || !Array.isArray(report.conflicts) || report.conflicts.length === 0) {
+                return '## Contradiction & Version Report\n- No high-signal conflicts detected in activated statements.';
+            }
+            const lines = [
+                '## Contradiction & Version Report',
+                `- Conflicts detected: ${report.conflicts.length}`,
+                `- Unresolved conflicts: ${report.unresolvedCount || 0}`
+            ];
+            for (const conflict of report.conflicts) {
+                const a = conflict.restrictive;
+                const b = conflict.permissive;
+                lines.push(`- Concept: ${conflict.concept}`);
+                lines.push(`  - Restrictive statement: ${String(a?.text || '').slice(0, 180)} ${a?.citation || ''}`);
+                lines.push(`  - Permissive/conditional statement: ${String(b?.text || '').slice(0, 180)} ${b?.citation || ''}`);
+                lines.push(`  - Restrictive scope/version: ${(a?.provenance?.scopeTags || []).join('; ') || 'none'} | ${a?.provenance?.versionTag || 'N/A'}`);
+                lines.push(`  - Permissive scope/version: ${(b?.provenance?.scopeTags || []).join('; ') || 'none'} | ${b?.provenance?.versionTag || 'N/A'}`);
+                lines.push(`  - Selection rule: ${conflict.selectionRule}`);
+            }
+            return lines.join('\n');
+        }
+
+        jaccardSimilarity(a, b) {
+            const tokA = new Set(this.tokenizeForDiagnostics(a));
+            const tokB = new Set(this.tokenizeForDiagnostics(b));
+            if (!tokA.size || !tokB.size) return 0;
+            let inter = 0;
+            for (const token of tokA) if (tokB.has(token)) inter += 1;
+            const union = tokA.size + tokB.size - inter;
+            return union ? inter / union : 0;
+        }
+
+        runClaimAdmissibilityGate(responseText, ledger = null, workingState = null, sources = []) {
+            const claims = this.extractClaimLines(responseText).slice(0, 36);
+            const allowedClaims = Array.from(new Set([
+                ...((workingState?.activatedStatements || []).map(item => String(item?.text || ''))),
+                ...((ledger?.admissibleClaims || []).map(item => String(item || ''))),
+                ...(sources || []).slice(0, 20).map(item => {
+                    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+                    if (!text) return '';
+                    const firstSentence = text.split(/(?<=[.!?])\s+/)[0] || text;
+                    return firstSentence.slice(0, 240);
+                })
+            ].map(item => item.replace(/\s+/g, ' ').trim()).filter(Boolean)));
+            const unsupported = [];
+            const uncited = [];
+            for (const claim of claims) {
+                const hasCitation = /\[Source:\s*[^,\]]+,\s*(?:page\s*)?[^,\]]+,\s*"[^"]+"\]/i.test(claim);
+                const isFactual = !/\b(maybe|might|could|if provided)\b/i.test(claim);
+                if (isFactual && !hasCitation) uncited.push(claim);
+                let best = 0;
+                for (const allowed of allowedClaims.slice(0, 220)) {
+                    const score = this.jaccardSimilarity(claim, allowed);
+                    if (score > best) best = score;
+                    if (best >= 0.38) break;
+                }
+                if (isFactual && best < 0.38) unsupported.push(claim);
+            }
+            return {
+                passed: unsupported.length === 0 && uncited.length === 0,
+                unsupportedClaims: unsupported.slice(0, 8),
+                uncitedClaims: uncited.slice(0, 8),
+                totalClaims: claims.length
+            };
+        }
+
+        buildInsufficientSupportResponse(query, completeness = null, gate = null, worldProfile = null, mentalModel = null, conflictReport = null) {
+            const lines = [
+                '## Conclusion',
+                '- Confidence label: Insufficient evidence',
+                '- Status: Insufficient support in provided sources.',
+                '',
+                '## Why output is withheld',
+                `- Query: ${query}`
+            ];
+            if (!worldProfile?.isDefined) lines.push('- World boundary is not defined; authoritative scope is ambiguous.');
+            for (const reason of (completeness?.reasons || []).slice(0, 6)) lines.push(`- ${reason}`);
+            for (const claim of (gate?.unsupportedClaims || []).slice(0, 6)) lines.push(`- Unsupported claim candidate: ${claim}`);
+            for (const claim of (gate?.uncitedClaims || []).slice(0, 6)) lines.push(`- Uncited claim candidate: ${claim}`);
+            lines.push('', '## What is missing');
+            const missing = [
+                ...(completeness?.requestedDocuments || []),
+                ...((mentalModel?.unknowns || []).slice(0, 6))
+            ];
+            if (missing.length) {
+                for (const item of missing.slice(0, 10)) lines.push(`- ${item}`);
+            } else {
+                lines.push('- Additional authoritative source passages that directly support unresolved claims.');
+            }
+            if ((conflictReport?.unresolvedCount || 0) > 0) {
+                lines.push('', this.formatConflictVersionReport(conflictReport));
+                lines.push('- Resolution required: please choose precedence rule for unresolved conflicts.');
+            }
+            if (worldProfile) {
+                lines.push('', this.formatWorldBoundaryBlock(worldProfile));
+            }
+            return lines.join('\n');
+        }
+
+        buildAuditableReport(responseText, mentalModel = null, evidenceMap = null, ledger = null, consistency = null, worldProfile = null, conflictReport = null, confidenceLabel = 'Partially supported') {
+            const lines = ['## Mental Model Summary'];
+            lines.push(`- Variables: ${(mentalModel?.variables || []).join(', ') || 'N/A'}`);
+            lines.push(`- Concepts: ${(mentalModel?.concepts || []).slice(0, 12).join(', ') || 'N/A'}`);
+            lines.push(`- Constraints: ${(mentalModel?.constraints || []).slice(0, 3).join(' | ') || 'N/A'}`);
+            lines.push(`- Unknowns: ${(mentalModel?.unknowns || []).slice(0, 4).join(' | ') || 'N/A'}`);
+            lines.push('', '## Evidence Map');
+            for (const line of (evidenceMap?.lines || ['- No evidence map available.'])) lines.push(line);
+            if (worldProfile) {
+                lines.push('', this.formatWorldBoundaryBlock(worldProfile));
+            }
+            lines.push('', '## Step-by-Step Reasoning Ledger');
+            for (const step of (ledger?.steps || [])) {
+                lines.push(`- ${step.id} | ${step.transformation}`);
+                lines.push(`  - Inputs: ${(step.inputStatementIds || []).join(', ') || 'N/A'}`);
+                lines.push(`  - Result: ${step.resultingStatement || 'N/A'}`);
+                const citations = Array.isArray(step.citations) ? step.citations.slice(0, 4) : [];
+                if (citations.length) {
+                    lines.push('  - Citations:');
+                    for (const citation of citations) lines.push(`    - ${citation}`);
+                }
+            }
+            lines.push('', '## Consistency and Counterexample Checks');
+            if (consistency?.passed) lines.push('- No blocking contradictions/sanity violations detected.');
+            else for (const issue of (consistency?.issues || []).slice(0, 8)) lines.push(`- ${issue}`);
+            lines.push('', this.formatConflictVersionReport(conflictReport));
+            lines.push('', '## Conclusion');
+            lines.push(`- Confidence label: ${confidenceLabel}`);
+            lines.push(responseText.trim());
+            return lines.join('\n');
+        }
+
         getSystemPrompt(context, corpusStats = {}, instructionProfile = {}, workingMemorySummary = '') {
             const numDocs = corpusStats.numDocs || 0;
             const numChunks = corpusStats.numChunks || 0;
@@ -2785,6 +3636,10 @@ ${answer}`
             const stepReq = instructionProfile.wantsSteps ? 'Yes' : 'No';
             const wordLimit = instructionProfile.wordLimit ? `${instructionProfile.wordLimit} words` : 'No explicit limit';
             const sourceOnly = 'Strictly source-grounded; do not use outside knowledge for factual claims.';
+            const worldSettings = corpusStats?.worldSettings || {};
+            const worldBoundary = String(worldSettings.corpusBoundary || '').trim() || 'UNDEFINED';
+            const worldPriority = String(worldSettings.priorityRules || '').trim() || 'Specific scope > generic rule; newer version > older.';
+            const worldTask = String(worldSettings.taskFrame || '').trim() || 'explain';
             return `You are a COGNITIVE SYNTHESIS ENGINE.
 
 You are given:
@@ -2815,6 +3670,12 @@ Instruction contract:
 - Step-by-step required: ${stepReq}
 - Length target: ${wordLimit}
 - Source grounding: ${sourceOnly}
+
+WORLD BOUNDARY (MANDATORY):
+- Authoritative corpus boundary: ${worldBoundary}
+- Priority rules: ${worldPriority}
+- Task framing mode: ${worldTask}
+- If boundary or priority is missing/ambiguous, abstain with "Insufficient support in provided sources."
 
 MANDATORY CITATION FORMAT:
 [Source: filename, page X, "brief relevant quote"]
@@ -2888,7 +3749,9 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
                 `- Step-by-step: ${instructionProfile.wantsSteps ? 'yes' : 'no'}`,
                 `- Word limit: ${instructionProfile.wordLimit ? instructionProfile.wordLimit : 'no strict limit'}`,
                 '- Source-only strictness: strict (use only provided sources)',
-                '- If evidence is insufficient, state uncertainty clearly instead of guessing.'
+                '- If evidence is insufficient, state uncertainty clearly instead of guessing.',
+                '- Write as an auditable reasoning report with: Mental Model Summary, Evidence Map, Step-by-Step Reasoning Ledger, and Conclusion.',
+                '- Conclusion confidence label must be one of: Supported | Partially supported | Insufficient evidence.'
             ];
             return lines.join('\n');
         }
@@ -2955,9 +3818,27 @@ ${fallback.text.slice(0, Math.min(2500, fallback.text.length))}`);
             const workingMemorySummary = this.getWorkingMemorySummary(query);
             const cognitivePlan = await this.buildCognitivePlan(query, instructionProfile, corpusStats, attachmentContext);
             const useMultiPass = this.shouldUseMultiPass(relevantChunks, attachmentContext, corpusStats, cognitivePlan);
+            const worldProfile = this.buildWorldBoundaryProfile(query, relevantChunks || [], corpusStats, instructionProfile);
 
             const contextSections = [];
             contextSections.push(this.formatPlanForContext(cognitivePlan));
+            contextSections.push(this.formatWorldBoundaryBlock(worldProfile));
+            if (corpusStats?.knowledgeStats) {
+                const stats = corpusStats.knowledgeStats;
+                contextSections.push(`## KNOWLEDGE NETWORK STATUS
+- Concepts: ${stats.concepts || 0}
+- Atomic statements: ${stats.statements || 0}
+- Typed edges: ${stats.edges || 0}
+- Ambiguous aliases tracked: ${stats.ambiguousAliases || 0}`);
+            }
+            if (corpusStats?.workingActivation) {
+                const workingState = corpusStats.workingActivation;
+                contextSections.push(`## WORKING MEMORY ACTIVATION SNAPSHOT
+- Activated concepts: ${workingState.activatedConcepts?.length || 0}
+- Activated statements: ${workingState.activatedStatements?.length || 0}
+- Doc diversity: ${workingState.docDiversity || 0}
+- Evidence sufficient: ${workingState.evidenceSufficient ? 'yes' : 'no'}`);
+            }
             if (attachmentContext?.memory) {
                 const m = attachmentContext.memory;
                 contextSections.push(`## ATTACHMENT MEMORY (FULL FILE)
@@ -3118,6 +3999,45 @@ ${attachmentEvidence.contextText}`);
                 coreStrictPostProcessing = strictResult.meta || coreStrictPostProcessing;
             }
 
+            const retriever = (typeof window !== 'undefined' && window.app?.retriever) ? window.app.retriever : null;
+            const workingState = retriever?.lastWorkingMemoryState || corpusStats?.workingActivation || null;
+            const finalWorldProfile = this.buildWorldBoundaryProfile(query, sources, corpusStats, instructionProfile);
+            const evidenceMap = this.buildEvidenceMapFromWorkingState(workingState, 14);
+            const mentalModel = this.buildMentalModelFromWorkingState(query, workingState, sources);
+            const reasoningLedger = this.buildReasoningLedger(query, mentalModel, workingState, sources);
+            const consistencyChecks = this.runConsistencyAndSanityChecks(workingState, mentalModel);
+            const conflictReport = this.buildConflictVersionReport(workingState);
+            const admissibilityGate = this.runClaimAdmissibilityGate(assistantMessage, reasoningLedger, workingState, sources);
+
+            const shouldAbstain = (
+                !finalWorldProfile.isDefined ||
+                !admissibilityGate.passed ||
+                !(workingState?.evidenceSufficient) ||
+                (conflictReport.unresolvedCount || 0) > 0 ||
+                !coreStrictPostProcessing.passed
+            );
+            if (shouldAbstain) {
+                assistantMessage = this.buildInsufficientSupportResponse(
+                    query,
+                    { reasons: coreStrictPostProcessing.reasons || [], requestedDocuments: mentalModel.unknowns || [] },
+                    admissibilityGate,
+                    finalWorldProfile,
+                    mentalModel,
+                    conflictReport
+                );
+            } else {
+                assistantMessage = this.buildAuditableReport(
+                    assistantMessage,
+                    mentalModel,
+                    evidenceMap,
+                    reasoningLedger,
+                    consistencyChecks,
+                    finalWorldProfile,
+                    conflictReport,
+                    reasoningLedger.confidenceLabel || 'Partially supported'
+                );
+            }
+
             this.conversationHistory.push({ role: 'user', content: query }, { role: 'assistant', content: assistantMessage });
             this.saveChatHistory();
             this.rememberTurn(query, assistantMessage);
@@ -3125,7 +4045,29 @@ ${attachmentEvidence.contextText}`);
             return {
                 response: assistantMessage,
                 sources,
-                meta: { instructionProfile, cognitivePlan, mapPassCount: mapNotes.length, citationCount, claimDiagnostics, coreStrictPostProcessing }
+                meta: {
+                    instructionProfile,
+                    cognitivePlan,
+                    mapPassCount: mapNotes.length,
+                    citationCount,
+                    claimDiagnostics,
+                    coreStrictPostProcessing,
+                    worldProfile: finalWorldProfile,
+                    evidenceMap,
+                    mentalModel,
+                    reasoningLedger,
+                    consistencyChecks,
+                    conflictReport,
+                    admissibilityGate,
+                    workingState: workingState
+                        ? {
+                            concepts: workingState.activatedConcepts?.length || 0,
+                            statements: workingState.activatedStatements?.length || 0,
+                            docDiversity: workingState.docDiversity || 0,
+                            evidenceSufficient: !!workingState.evidenceSufficient
+                        }
+                        : null
+                }
             };
         }
     }
@@ -3543,6 +4485,10 @@ ${attachmentEvidence.contextText}`);
             this.apiKeyInput = document.getElementById('apiKeyInput');
             this.saveApiKeyBtn = document.getElementById('saveApiKey');
             this.modelSelect = document.getElementById('modelSelect');
+            this.worldBoundaryInput = document.getElementById('worldBoundaryInput');
+            this.priorityRulesInput = document.getElementById('priorityRulesInput');
+            this.taskFrameSelect = document.getElementById('taskFrameSelect');
+            this.saveWorldSettingsBtn = document.getElementById('saveWorldSettings');
             this.processingStatus = document.getElementById('processingStatus');
             this.processingText = document.getElementById('processingText');
             this.processingBarFill = document.getElementById('processingBarFill');
@@ -3557,6 +4503,66 @@ ${attachmentEvidence.contextText}`);
             this.toastContainer = document.getElementById('toastContainer');
             this.apiKeyInput.value = localStorage.getItem('openai_api_key') || '';
             this.modelSelect.value = localStorage.getItem('openai_model') || 'gpt-4.1';
+            const worldSettings = this.getWorldSettings();
+            if (this.worldBoundaryInput) this.worldBoundaryInput.value = worldSettings.corpusBoundary || '';
+            if (this.priorityRulesInput) this.priorityRulesInput.value = worldSettings.priorityRules || '';
+            if (this.taskFrameSelect) this.taskFrameSelect.value = worldSettings.taskFrame || 'explain';
+        }
+
+        getDefaultWorldSettings() {
+            return {
+                corpusBoundary: '',
+                priorityRules: [
+                    'Specific scope clause overrides generic guidance.',
+                    'When versions conflict, newer edition/date supersedes older.',
+                    'If conflict remains unresolved, abstain and request user precedence.'
+                ].join('\n'),
+                taskFrame: 'explain'
+            };
+        }
+
+        getWorldSettings() {
+            const fallback = this.getDefaultWorldSettings();
+            const raw = localStorage.getItem(WORLD_SETTINGS_STORAGE_KEY);
+            if (!raw) return fallback;
+            try {
+                const parsed = JSON.parse(raw);
+                if (!parsed || typeof parsed !== 'object') return fallback;
+                return {
+                    corpusBoundary: String(parsed.corpusBoundary || '').trim(),
+                    priorityRules: String(parsed.priorityRules || fallback.priorityRules).trim(),
+                    taskFrame: ['explain', 'compute', 'decide', 'troubleshoot'].includes(String(parsed.taskFrame || ''))
+                        ? String(parsed.taskFrame)
+                        : fallback.taskFrame
+                };
+            } catch {
+                return fallback;
+            }
+        }
+
+        saveWorldSettings(showToast = true) {
+            const boundary = String(this.worldBoundaryInput?.value || '').trim();
+            const priorityRules = String(this.priorityRulesInput?.value || '').trim();
+            const taskFrame = String(this.taskFrameSelect?.value || 'explain').trim();
+            if (!boundary) {
+                if (showToast) this.showToast('Define corpus boundary before saving world settings.', 'warning');
+                return false;
+            }
+            const payload = {
+                corpusBoundary: boundary,
+                priorityRules: priorityRules || this.getDefaultWorldSettings().priorityRules,
+                taskFrame: ['explain', 'compute', 'decide', 'troubleshoot'].includes(taskFrame) ? taskFrame : 'explain'
+            };
+            localStorage.setItem(WORLD_SETTINGS_STORAGE_KEY, JSON.stringify(payload));
+            localStorage.setItem(WORLD_SETTINGS_DEFINED_KEY, '1');
+            if (showToast) this.showToast('World settings saved.', 'success');
+            return true;
+        }
+
+        isWorldSettingsDefined() {
+            const defined = localStorage.getItem(WORLD_SETTINGS_DEFINED_KEY) === '1';
+            const boundary = String(this.worldBoundaryInput?.value || this.getWorldSettings().corpusBoundary || '').trim();
+            return defined && boundary.length > 0;
         }
 
         bindEvents() {
@@ -3594,11 +4600,15 @@ ${attachmentEvidence.contextText}`);
                 if (key) {
                     this.synthesizer.setApiKey(key);
                     this.retriever.setEmbeddingApiKey(key);
+                    this.saveWorldSettings(false);
                     this.showToast('API key saved successfully', 'success');
                 } else {
                     this.showToast('Please enter a valid API key', 'error');
                 }
             });
+            if (this.saveWorldSettingsBtn) {
+                this.saveWorldSettingsBtn.addEventListener('click', () => this.saveWorldSettings(true));
+            }
             this.modelSelect.addEventListener('change', () => {
                 this.synthesizer.setModel(this.modelSelect.value);
                 this.showToast(`Model changed to ${this.modelSelect.value}`, 'success');
@@ -3757,12 +4767,18 @@ ${attachmentEvidence.contextText}`);
                 .filter(doc => relevantFilenames.has(doc.filename))
                 .slice(0, 10)
                 .map(doc => ({ filename: doc.filename, memory: doc.memory }));
+            const worldSettings = this.getWorldSettings();
+            const knowledgeStats = this.retriever.lastKnowledgeGraphStats || {};
+            const workingState = this.retriever.lastWorkingMemoryState || null;
             return {
                 numDocs: this.retriever.documents.length,
                 numChunks: this.retriever.allChunks.length,
                 connectedConcepts: this.retriever.getTopConnectedConcepts(10),
                 documentMemories,
-                corpusDigest: intent?.broadCoverage ? this.retriever.buildCorpusDigest(query, relevantChunks, 16) : ''
+                corpusDigest: intent?.broadCoverage ? this.retriever.buildCorpusDigest(query, relevantChunks, 16) : '',
+                worldSettings,
+                knowledgeStats,
+                workingActivation: workingState
             };
         }
 
@@ -3771,6 +4787,7 @@ ${attachmentEvidence.contextText}`);
             if (!query) throw new Error('Benchmark task query is empty.');
             if (!this.synthesizer.apiKey) throw new Error('API key not configured for benchmark execution.');
             if (!this.retriever.allChunks.length) throw new Error('No corpus documents available for benchmark execution.');
+            if (!this.isWorldSettingsDefined()) throw new Error('World boundary settings are required before benchmark execution.');
 
             const historySnapshot = Array.isArray(this.synthesizer.conversationHistory)
                 ? [...this.synthesizer.conversationHistory]
@@ -3797,6 +4814,11 @@ ${attachmentEvidence.contextText}`);
             if (!query) return;
             if (!this.synthesizer.apiKey) {
                 this.showToast('Please configure your OpenAI API key in Admin Panel', 'error');
+                this.toggleAdminPanel(true);
+                return;
+            }
+            if (!this.isWorldSettingsDefined()) {
+                this.showToast('Define world boundary settings in Admin Panel before querying.', 'warning');
                 this.toggleAdminPanel(true);
                 return;
             }
@@ -3873,6 +4895,11 @@ ${attachmentEvidence.contextText}`);
         async runEvaluationHarness() {
             if (!this.evaluator) {
                 this.showToast('Evaluator unavailable.', 'error');
+                return;
+            }
+            if (!this.isWorldSettingsDefined()) {
+                this.showToast('Define world boundary settings before running evaluation harness.', 'warning');
+                this.toggleAdminPanel(true);
                 return;
             }
             if (!this.retriever.documents.length) {
@@ -6518,6 +7545,10 @@ ${attachmentEvidence.contextText}`);
                     corpusStats = {},
                     instructionProfile = {}
                 ) {
+                    const configured = corpusStats?.worldSettings || {};
+                    const configuredBoundary = String(configured.corpusBoundary || '').trim();
+                    const configuredPriority = String(configured.priorityRules || '').trim();
+                    const configuredTask = String(configured.taskFrame || '').trim();
                     const authoritativeDocs = uniqueBy(
                         (sources || []).map(item => String(item?.filename || '').trim()).filter(Boolean),
                         item => normalizeTextLite(item)
@@ -6537,14 +7568,21 @@ ${attachmentEvidence.contextText}`);
                         'If scope is equal and versions differ, prefer the more recent version/date.',
                         'If conflict is unresolved after source rules, abstain and ask user to choose precedence.'
                     ];
+                    if (configuredPriority) {
+                        for (const line of configuredPriority.split(/\n+/).map(item => item.trim()).filter(Boolean).slice(0, 6).reverse()) {
+                            defaultPriorityRules.unshift(`User priority rule: ${line}`);
+                        }
+                    }
                     if (explicitPriorityMatch?.[1]) defaultPriorityRules.unshift(`User priority rule: ${explicitPriorityMatch[1].trim()}`);
                     return {
-                        corpusBoundary: explicitAuthorityMatch?.[1]
+                        corpusBoundary: configuredBoundary ||
+                            (explicitAuthorityMatch?.[1]
                             ? explicitAuthorityMatch[1].trim()
-                            : (authoritativeDocs.length ? `${authoritativeDocs.length} uploaded corpus documents` : 'No authoritative corpus defined'),
+                            : (authoritativeDocs.length ? `${authoritativeDocs.length} uploaded corpus documents` : 'No authoritative corpus defined')),
                         authoritativeDocs: authoritativeDocs.slice(0, 24),
                         priorityRules: defaultPriorityRules.slice(0, 6),
-                        taskFrame,
+                        taskFrame: ['explain', 'compute', 'decide', 'troubleshoot'].includes(configuredTask) ? configuredTask : taskFrame,
+                        isDefined: (configuredBoundary || explicitAuthorityMatch?.[1] || '').toString().trim().length > 0,
                         strictSourceOnly: true,
                         requestedFormat: instructionProfile?.requestedFormat || 'structured prose',
                         corpusStats: {
@@ -7401,7 +8439,8 @@ ${attachmentEvidence.contextText}`);
                     diagnosticSources
                 );
                 localStats.superBrainAdmissibility = admissibility;
-                if (shouldRequestMoreEvidence || !admissibility.passed) {
+                const missingWorldDefinition = localStats.superBrainWorldBoundary && localStats.superBrainWorldBoundary.isDefined === false;
+                if (shouldRequestMoreEvidence || !admissibility.passed || missingWorldDefinition) {
                     result.response = this.superBrainBuildInsufficientSupportResponse(
                         query,
                         admissibility,

@@ -7,8 +7,8 @@ This repository now contains:
 - `super_brain_rag_patch.js` (optional external drop-in patch file)
 
 `chatbot.html` is fully self-contained; it does not require external patch loading.
-The inline "super-brain enhancer" is now **enabled by default**.  
-To disable it explicitly, set `localStorage["enable_inline_super_brain_enhancer"]="0"`.
+Core hard-cognition safeguards now run in the main engine path.
+The inline "super-brain enhancer" remains optional (off by default) for experimental augmentation.
 
 ---
 
