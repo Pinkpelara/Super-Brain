@@ -3267,7 +3267,7 @@ ${attachmentEvidence.contextText}`);
             console.log('Cognitive Synthesis Engine initialized successfully');
         } catch (error) {
             console.error('Failed to initialize application:', error);
-            alert('Failed to initialize the application. Please refresh the page.');
+            alert(`Failed to initialize the application: ${error?.message || 'Unknown error'}. Please refresh the page.`);
         }
     }
 
@@ -4373,6 +4373,58 @@ ${attachmentEvidence.contextText}`);
             localStorage.setItem(WORLD_RULES_STORAGE_KEY, JSON.stringify(rules));
         }
 
+        function ensureSafeStorageAccess() {
+            try {
+                if (typeof window === 'undefined' || !window.Storage || !window.Storage.prototype) return;
+                const proto = window.Storage.prototype;
+                if (proto.__hardCognitionSafeStoragePatched) return;
+
+                const fallback = new Map();
+                const originalGet = proto.getItem;
+                const originalSet = proto.setItem;
+                const originalRemove = proto.removeItem;
+                const originalClear = proto.clear;
+
+                proto.getItem = function patchedGetItem(key) {
+                    const k = String(key);
+                    try {
+                        return originalGet.call(this, k);
+                    } catch {
+                        return fallback.has(k) ? fallback.get(k) : null;
+                    }
+                };
+
+                proto.setItem = function patchedSetItem(key, value) {
+                    const k = String(key);
+                    const v = String(value);
+                    try {
+                        originalSet.call(this, k, v);
+                    } catch {
+                        fallback.set(k, v);
+                    }
+                };
+
+                proto.removeItem = function patchedRemoveItem(key) {
+                    const k = String(key);
+                    try {
+                        originalRemove.call(this, k);
+                    } catch {
+                        fallback.delete(k);
+                    }
+                };
+
+                proto.clear = function patchedClear() {
+                    try {
+                        originalClear.call(this);
+                    } catch {
+                        fallback.clear();
+                    }
+                };
+
+                proto.__hardCognitionSafeStoragePatched = true;
+            } catch {}
+        }
+
         function deriveAtomicKnowledge(doc) {
             const statementList = [];
             const typedLinks = [];
@@ -4537,9 +4589,107 @@ ${attachmentEvidence.contextText}`);
         }
 
         function install() {
-            if (typeof DocumentProcessor !== 'function' || typeof CognitiveRetriever !== 'function' || typeof CognitiveSynthesizer !== 'function') {
+            if (
+                typeof DocumentDatabase !== 'function' ||
+                typeof DocumentProcessor !== 'function' ||
+                typeof CognitiveRetriever !== 'function' ||
+                typeof CognitiveSynthesizer !== 'function'
+            ) {
                 return false;
             }
+
+            ensureSafeStorageAccess();
+
+            patchMethod(DocumentDatabase, 'init', (original) => async function patchedDbInit() {
+                this.useMemoryFallback = false;
+                this.memoryStore = this.memoryStore || [];
+                this.memoryAutoId = this.memoryAutoId || 1;
+
+                try {
+                    if (typeof indexedDB === 'undefined') {
+                        throw new Error('IndexedDB API unavailable');
+                    }
+                    const result = await original.call(this);
+                    this.useMemoryFallback = false;
+                    return result;
+                } catch (error) {
+                    this.db = null;
+                    this.useMemoryFallback = true;
+                    this.memoryFallbackReason = error?.message || 'IndexedDB init failed';
+                    try {
+                        console.warn(`[Hard Cognition Guardrail Patch] IndexedDB unavailable, using memory fallback: ${this.memoryFallbackReason}`);
+                    } catch {}
+                    return null;
+                }
+            });
+
+            patchMethod(DocumentDatabase, 'addDocument', (original) => async function patchedDbAddDocument(doc) {
+                if (this.useMemoryFallback || !this.db) {
+                    const id = this.memoryAutoId++;
+                    this.memoryStore.push({ ...doc, id });
+                    return id;
+                }
+                try {
+                    return await original.call(this, doc);
+                } catch (error) {
+                    this.useMemoryFallback = true;
+                    const id = this.memoryAutoId++;
+                    this.memoryStore.push({ ...doc, id });
+                    try {
+                        console.warn(`[Hard Cognition Guardrail Patch] addDocument fallback enabled: ${error?.message || 'unknown error'}`);
+                    } catch {}
+                    return id;
+                }
+            });
+
+            patchMethod(DocumentDatabase, 'getAllDocuments', (original) => async function patchedDbGetAllDocuments() {
+                if (this.useMemoryFallback || !this.db) {
+                    return (this.memoryStore || []).slice();
+                }
+                try {
+                    return await original.call(this);
+                } catch (error) {
+                    this.useMemoryFallback = true;
+                    try {
+                        console.warn(`[Hard Cognition Guardrail Patch] getAllDocuments fallback enabled: ${error?.message || 'unknown error'}`);
+                    } catch {}
+                    return (this.memoryStore || []).slice();
+                }
+            });
+
+            patchMethod(DocumentDatabase, 'deleteDocument', (original) => async function patchedDbDeleteDocument(id) {
+                if (this.useMemoryFallback || !this.db) {
+                    this.memoryStore = (this.memoryStore || []).filter(doc => doc.id !== id);
+                    return;
+                }
+                try {
+                    return await original.call(this, id);
+                } catch (error) {
+                    this.useMemoryFallback = true;
+                    this.memoryStore = (this.memoryStore || []).filter(doc => doc.id !== id);
+                    try {
+                        console.warn(`[Hard Cognition Guardrail Patch] deleteDocument fallback enabled: ${error?.message || 'unknown error'}`);
+                    } catch {}
+                    return;
+                }
+            });
+
+            patchMethod(DocumentDatabase, 'clearAll', (original) => async function patchedDbClearAll() {
+                if (this.useMemoryFallback || !this.db) {
+                    this.memoryStore = [];
+                    return;
+                }
+                try {
+                    return await original.call(this);
+                } catch (error) {
+                    this.useMemoryFallback = true;
+                    this.memoryStore = [];
+                    try {
+                        console.warn(`[Hard Cognition Guardrail Patch] clearAll fallback enabled: ${error?.message || 'unknown error'}`);
+                    } catch {}
+                    return;
+                }
+            });
 
             patchMethod(DocumentProcessor, 'processFile', (original) => async function patchedProcessFile(file) {
                 const doc = await original.call(this, file);
