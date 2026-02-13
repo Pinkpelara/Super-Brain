@@ -7,7 +7,8 @@ This repository now contains:
 - `super_brain_rag_patch.js` (optional external drop-in patch file)
 
 `chatbot.html` is fully self-contained; it does not require external patch loading.
-The optional inline "super-brain enhancer" is now **opt-in** (disabled by default) to prioritize stable, grounded behavior.
+The inline "super-brain enhancer" is now **enabled by default**.  
+To disable it explicitly, set `localStorage["enable_inline_super_brain_enhancer"]="0"`.
 
 ---
 
@@ -92,6 +93,31 @@ The optional inline "super-brain enhancer" is now **opt-in** (disabled by defaul
   - Inferred Implications
   - Perspective Analysis (when stakeholder conflicts are relevant)
 - Adds perspective-taking evidence maps to simulate multi-stakeholder viewpoints in complex decision questions.
+
+### 12) Hard cognition compliance layer (no-hallucination controls)
+- Builds a **knowledge network** from corpus chunks using:
+  - concept registry (canonical concepts, aliases, ambiguity tracking),
+  - atomic source statements,
+  - typed relations (`defines`, `depends-on`, `causes`, `part-of`, `example-of`, `contradicts`, `exception-to`, `prerequisite-for`),
+  - per-statement provenance (file, section, page, version/scope tags).
+- Adds **working-memory spreading activation** over the knowledge graph (multi-hop with decay + diversity pressure).
+- Adds a deterministic **reasoning ledger** with step records:
+  - input statement IDs,
+  - transformation/rule,
+  - result statement,
+  - citations,
+  - admissibility mode (`stated`, `entailed`, `abstain`).
+- Adds **claim admissibility gate** before shipping final output:
+  - unsupported or uncited factual claims fail the gate,
+  - gate failure returns abstention-style output with explicit missing evidence requests.
+- Adds **scope/version conflict report** for contradictory rules and documents.
+- Final answer is wrapped as an **auditable report**:
+  - Mental Model Summary
+  - Evidence Map
+  - World Boundary
+  - Reasoning Ledger
+  - Contradiction & Version Report
+  - Conclusion with confidence label.
 
 ---
 
